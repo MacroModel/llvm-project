@@ -560,7 +560,7 @@ void Writer::createECCodeMap() {
   codeMap.clear();
 
   std::optional<chpe_range_type> lastType;
-  Chunk *first = nullptr, *last = nullptr;
+  Chunk *first, *last;
 
   auto closeRange = [&]() {
     if (lastType) {
@@ -1379,7 +1379,7 @@ void Writer::createSymbolAndStringTable() {
     sec->setStringTableOff(addEntryToStringTable(sec->name));
   }
 
-  if (ctx.config.debugDwarf || ctx.config.debugSymtab) {
+  if (ctx.config.writeSymtab) {
     for (ObjFile *file : ctx.objFileInstances) {
       for (Symbol *b : file->getSymbols()) {
         auto *d = dyn_cast_or_null<Defined>(b);
