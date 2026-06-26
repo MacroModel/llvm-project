@@ -38,6 +38,7 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 #include <iterator>
+#include <limits>
 using namespace llvm;
 
 #define DEBUG_TYPE "wasm-reg-stackify"
@@ -1010,6 +1011,141 @@ struct ProfileGateResult {
   bool ProfileVeto = false;
 };
 
+enum class StackifyActionKind {
+  KeepLocal,
+  Move,
+  Rematerialize,
+  Tee,
+};
+
+struct StackifyActionCandidate {
+  StackifyActionKind Kind = StackifyActionKind::KeepLocal;
+  bool Legal = false;
+  WasmExecPressureResult Pressure;
+  int64_t Score = std::numeric_limits<int64_t>::max();
+};
+
+static StringRef actionName(StackifyActionKind Kind) {
+  switch (Kind) {
+  case StackifyActionKind::KeepLocal:
+    return "keep-local";
+  case StackifyActionKind::Move:
+    return "move";
+  case StackifyActionKind::Rematerialize:
+    return "rematerialize";
+  case StackifyActionKind::Tee:
+    return "tee";
+  }
+  llvm_unreachable("unknown stackify action");
+}
+
+static unsigned actionPriority(StackifyActionKind Kind) {
+  switch (Kind) {
+  case StackifyActionKind::Move:
+    return 0;
+  case StackifyActionKind::Rematerialize:
+    return 1;
+  case StackifyActionKind::Tee:
+    return 2;
+  case StackifyActionKind::KeepLocal:
+    return 3;
+  }
+  llvm_unreachable("unknown stackify action");
+}
+
+static bool isFPAddOpcode(unsigned Opcode) {
+  switch (Opcode) {
+  case WebAssembly::ADD_F32:
+  case WebAssembly::ADD_F64:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static bool isFPMulOpcode(unsigned Opcode) {
+  switch (Opcode) {
+  case WebAssembly::MUL_F32:
+  case WebAssembly::MUL_F64:
+    return true;
+  default:
+    return false;
+  }
+}
+
+// Product-bank splitting is allowed to bias local boundaries, but not to change
+// strict FP reduction shape. Require reassoc on every inspected FP add/mul
+// node.
+static bool isReassocFPProductBankNodeImpl(
+    const MachineInstr *MI, const MachineRegisterInfo &MRI, unsigned Limit,
+    SmallPtrSetImpl<const MachineInstr *> &Visiting) {
+  if (!MI || !MI->getFlag(MachineInstr::FmReassoc))
+    return false;
+  if (isFPMulOpcode(MI->getOpcode()))
+    return true;
+  if (!isFPAddOpcode(MI->getOpcode()) || Limit == 0)
+    return false;
+  if (!Visiting.insert(MI).second)
+    return false;
+
+  for (const MachineOperand &MO : MI->explicit_uses()) {
+    if (!MO.isReg() || !MO.getReg().isVirtual())
+      continue;
+    if (isReassocFPProductBankNodeImpl(MRI.getUniqueVRegDef(MO.getReg()), MRI,
+                                       Limit - 1, Visiting)) {
+      Visiting.erase(MI);
+      return true;
+    }
+  }
+
+  Visiting.erase(MI);
+  return false;
+}
+
+static bool isReassocFPProductBankNode(const MachineInstr *MI,
+                                       const MachineRegisterInfo &MRI) {
+  SmallPtrSet<const MachineInstr *, 16> Visiting;
+  return isReassocFPProductBankNodeImpl(MI, MRI, /*Limit=*/16, Visiting);
+}
+
+static bool isReassocFPProductBankEdge(Register Reg, MachineInstr *DefI,
+                                       MachineInstr *Insert,
+                                       const MachineRegisterInfo &MRI) {
+  if (!DefI || !Insert)
+    return false;
+  if (!isWasmFPReg(Reg, MRI))
+    return false;
+  if (!isFPAddOpcode(Insert->getOpcode()))
+    return false;
+  return Insert->getFlag(MachineInstr::FmReassoc) &&
+         isReassocFPProductBankNode(DefI, MRI);
+}
+
+static bool shouldPreferProductBankBoundary(
+    const WasmExecutionProfile &Profile, Register Reg, MachineInstr *DefI,
+    MachineInstr *Insert, const MachineRegisterInfo &MRI,
+    const WasmExecPressureResult &StackifiedPressure) {
+  if (!Profile.HasRegisterRing || !Profile.FPRingCapacity)
+    return false;
+  if (!isReassocFPProductBankEdge(Reg, DefI, Insert, MRI))
+    return false;
+  return StackifiedPressure.PeakFP >= Profile.PreferredFPBank;
+}
+
+static int64_t
+productBankBoundaryPenalty(const WasmExecutionProfile &Profile, Register Reg,
+                           MachineInstr *DefI, MachineInstr *Insert,
+                           const MachineRegisterInfo &MRI,
+                           const WasmExecPressureResult &StackifiedPressure) {
+  if (!shouldPreferProductBankBoundary(Profile, Reg, DefI, Insert, MRI,
+                                       StackifiedPressure))
+    return 0;
+
+  unsigned Saturation = StackifiedPressure.PeakFP - Profile.PreferredFPBank + 1;
+  return int64_t(Saturation) * (Profile.SpillCost + Profile.FillCost +
+                                Profile.LocalGetCost + Profile.LocalSetCost);
+}
+
 static ProfileGateResult profileGateU2Delta(const WebAssemblySubtarget &ST,
                                             Register Reg, MachineInstr *DefI,
                                             MachineInstr *Insert,
@@ -1188,16 +1324,148 @@ static WasmExecPressureResult estimatePressureForProfileCandidate(
   return R;
 }
 
+static unsigned estimateRemainingUseDistance(Register Reg, MachineInstr *Insert,
+                                             const MachineRegisterInfo &MRI,
+                                             unsigned Limit) {
+  unsigned MaxDistance = 0;
+  for (const MachineOperand &MO : MRI.use_nodbg_operands(Reg)) {
+    const MachineInstr *UseMI = MO.getParent();
+    if (UseMI == Insert || UseMI->getParent() != Insert->getParent())
+      continue;
+    unsigned Dist = nonDebugDistance(Insert, UseMI, Limit);
+    MaxDistance = std::max(MaxDistance, Dist);
+  }
+  return MaxDistance;
+}
+
+static StackifyActionCandidate scoreStackifyAction(
+    StackifyActionKind Kind, bool Legal, Register Reg, MachineInstr *DefI,
+    MachineInstr *Insert, const MachineRegisterInfo &MRI,
+    const WebAssemblyFunctionInfo &MFI, const WasmExecutionProfile &Profile) {
+  StackifyActionCandidate Candidate;
+  Candidate.Kind = Kind;
+  Candidate.Legal = Legal;
+  if (!Legal)
+    return Candidate;
+
+  Candidate.Pressure = Kind == StackifyActionKind::KeepLocal
+                           ? estimatePressureForProfileCandidate(
+                                 Insert, Register(), nullptr, MRI, MFI, Profile)
+                           : estimatePressureForProfileCandidate(
+                                 Insert, Reg, DefI, MRI, MFI, Profile);
+  Candidate.Score = Candidate.Pressure.Score;
+
+  if (Kind == StackifyActionKind::Rematerialize) {
+    Candidate.Score += Profile.CodeSizeCost;
+    if (Profile.HasRegisterRing)
+      Candidate.Score += Profile.DispatchCost;
+  } else if (Kind == StackifyActionKind::Tee) {
+    Candidate.Score += Profile.TeeCost;
+    unsigned RemainingUseDistance =
+        estimateRemainingUseDistance(Reg, Insert, MRI, /*Limit=*/16);
+    if (Profile.HasM3SlotProviderModel && RemainingUseDistance > 3)
+      Candidate.Score += (RemainingUseDistance - 3) * Profile.LocalGetCost;
+    else if (Profile.HasRegisterRing && RemainingUseDistance > 8)
+      Candidate.Score += RemainingUseDistance - 8;
+  }
+
+  if (Kind != StackifyActionKind::KeepLocal)
+    Candidate.Score += productBankBoundaryPenalty(Profile, Reg, DefI, Insert,
+                                                  MRI, Candidate.Pressure);
+
+  return Candidate;
+}
+
+static bool isBetterAction(const StackifyActionCandidate &Candidate,
+                           const StackifyActionCandidate &Best) {
+  if (!Candidate.Legal)
+    return false;
+  if (!Best.Legal)
+    return true;
+  if (Candidate.Score != Best.Score)
+    return Candidate.Score < Best.Score;
+  return actionPriority(Candidate.Kind) < actionPriority(Best.Kind);
+}
+
+static StackifyActionCandidate
+chooseProfileActionCandidate(const WebAssemblySubtarget &ST, Register Reg,
+                             MachineInstr *DefI, MachineInstr *Insert,
+                             const MachineRegisterInfo &MRI,
+                             const WebAssemblyFunctionInfo &MFI, bool MoveLegal,
+                             const ProfileGateResult &MoveGate, bool RematLegal,
+                             const ProfileGateResult &RematGate, bool TeeLegal,
+                             const ProfileGateResult &TeeGate) {
+  const WasmExecutionProfile &Profile = ST.getExecutionProfile();
+  StackifyActionCandidate Keep =
+      scoreStackifyAction(StackifyActionKind::KeepLocal, /*Legal=*/true, Reg,
+                          DefI, Insert, MRI, MFI, Profile);
+  StackifyActionCandidate Move =
+      scoreStackifyAction(StackifyActionKind::Move, MoveLegal && MoveGate.Allow,
+                          Reg, DefI, Insert, MRI, MFI, Profile);
+  StackifyActionCandidate Remat = scoreStackifyAction(
+      StackifyActionKind::Rematerialize, RematLegal && RematGate.Allow, Reg,
+      DefI, Insert, MRI, MFI, Profile);
+  StackifyActionCandidate Tee =
+      scoreStackifyAction(StackifyActionKind::Tee, TeeLegal && TeeGate.Allow,
+                          Reg, DefI, Insert, MRI, MFI, Profile);
+
+  StackifyActionCandidate Historical = Keep;
+  if (Move.Legal)
+    Historical = Move;
+  else if (Remat.Legal)
+    Historical = Remat;
+  else if (Tee.Legal)
+    Historical = Tee;
+
+  StackifyActionCandidate Best = Historical;
+  if (shouldPreferProductBankBoundary(Profile, Reg, DefI, Insert, MRI,
+                                      Historical.Pressure) &&
+      isBetterAction(Keep, Best))
+    Best = Keep;
+  if (isBetterAction(Move, Best))
+    Best = Move;
+  if (isBetterAction(Remat, Best))
+    Best = Remat;
+  if (isBetterAction(Tee, Best))
+    Best = Tee;
+
+  // The bounded estimator can undercount a newly inspected tree. Do not choose
+  // a non-historical action only because a partial estimate looks better.
+  if (Best.Pressure.HitLimit && !Historical.Pressure.HitLimit)
+    Best = Historical;
+
+  StackifyActionCandidate Chosen = Historical;
+  if (Best.Kind != Historical.Kind &&
+      Best.Score + WasmTuneStackifyScoreHysteresis < Historical.Score)
+    Chosen = Best;
+
+  LLVM_DEBUG({
+    if (Chosen.Kind != Historical.Kind) {
+      dbgs() << "wasm-tune-stackify: choose-action"
+             << " tune=" << ST.getTuneCPUName()
+             << " historical=" << actionName(Historical.Kind)
+             << " chosen=" << actionName(Chosen.Kind)
+             << " historical-score=" << Historical.Score
+             << " chosen-score=" << Chosen.Score << " historical-overflow="
+             << totalOverflow(Profile, Historical.Pressure)
+             << " chosen-overflow=" << totalOverflow(Profile, Chosen.Pressure)
+             << "\n";
+    }
+  });
+
+  return Chosen;
+}
+
 static bool isProfileCommuteBetter(const WasmExecutionProfile &Profile,
                                    const WasmExecPressureResult &Before,
                                    const WasmExecPressureResult &After) {
+  if (After.HitLimit && !Before.HitLimit)
+    return false;
+
   unsigned BeforeOverflow = totalOverflow(Profile, Before);
   unsigned AfterOverflow = totalOverflow(Profile, After);
   if (AfterOverflow != BeforeOverflow)
     return AfterOverflow < BeforeOverflow;
-
-  if (After.HitLimit && !Before.HitLimit)
-    return false;
 
   if (Profile.HasM3SlotProviderModel) {
     if (After.PeakFP != Before.PeakFP)
@@ -1253,7 +1521,9 @@ static bool maybeProfileCommuteAfterVeto(
     return true;
   }
 
-  TII->commuteInstruction(*Insert, /*NewMI=*/false, Operand0, Operand1);
+  [[maybe_unused]] MachineInstr *Restored =
+      TII->commuteInstruction(*Insert, /*NewMI=*/false, Operand0, Operand1);
+  assert(Restored == Insert && "Expected in-place commute restoration");
   return false;
 }
 
@@ -1343,6 +1613,13 @@ bool WebAssemblyRegStackify::runOnMachineFunction(MachineFunction &MF) {
         bool CanMove = SameBlock &&
                        isSafeToMove(Def, &Use, Insert, MFI, MRI, Optimize) &&
                        !TreeWalker.isOnStack(Reg);
+        bool MoveLegal =
+            CanMove && hasSingleUse(Reg, MRI, MF, Optimize, DefI, LIS);
+        bool RematLegal = Optimize && shouldRematerialize(*DefI, TII);
+        bool TeeLegal =
+            Optimize && CanMove &&
+            oneUseDominatesOtherUses(Reg, Use, MBB, MRI, *MDT, *LIS, MFI);
+
         bool Stackified = false;
         bool ProfileVetoed = false;
         Register ProfileVetoReg;
@@ -1357,11 +1634,45 @@ bool WebAssemblyRegStackify::runOnMachineFunction(MachineFunction &MF) {
           }
         };
 
-        if (CanMove && hasSingleUse(Reg, MRI, MF, Optimize, DefI, LIS)) {
-          ProfileGateResult Gate =
-              profileGateMove(WasmST, Reg, DefI, Insert, MRI, MFI);
-          RecordProfileVeto(Gate);
-          if (Gate.Allow) {
+        ProfileGateResult MoveGate;
+        ProfileGateResult RematGate;
+        ProfileGateResult TeeGate;
+        if (MoveLegal) {
+          MoveGate = profileGateMove(WasmST, Reg, DefI, Insert, MRI, MFI);
+          RecordProfileVeto(MoveGate);
+        }
+        if (RematLegal) {
+          RematGate =
+              profileGateRematerialize(WasmST, Reg, DefI, Insert, MRI, MFI);
+          RecordProfileVeto(RematGate);
+        }
+        if (TeeLegal) {
+          TeeGate = profileGateTee(WasmST, Reg, DefI, Insert, MRI, MFI);
+          RecordProfileVeto(TeeGate);
+        }
+
+        bool HasAllowedStackify = (MoveLegal && MoveGate.Allow) ||
+                                  (RematLegal && RematGate.Allow) ||
+                                  (TeeLegal && TeeGate.Allow);
+
+        StackifyActionKind SelectedAction = StackifyActionKind::KeepLocal;
+        if (shouldUseProfileGate(WasmST.getExecutionProfile(), Insert)) {
+          SelectedAction =
+              chooseProfileActionCandidate(WasmST, Reg, DefI, Insert, MRI, MFI,
+                                           MoveLegal, MoveGate, RematLegal,
+                                           RematGate, TeeLegal, TeeGate)
+                  .Kind;
+        } else if (MoveLegal && MoveGate.Allow) {
+          SelectedAction = StackifyActionKind::Move;
+        } else if (RematLegal && RematGate.Allow) {
+          SelectedAction = StackifyActionKind::Rematerialize;
+        } else if (TeeLegal && TeeGate.Allow) {
+          SelectedAction = StackifyActionKind::Tee;
+        }
+
+        switch (SelectedAction) {
+        case StackifyActionKind::Move:
+          if (MoveLegal && MoveGate.Allow) {
             Insert =
                 moveForSingleUse(Reg, Use, DefI, MBB, Insert, LIS, MFI, MRI);
 
@@ -1375,41 +1686,36 @@ bool WebAssemblyRegStackify::runOnMachineFunction(MachineFunction &MF) {
             }
             Stackified = true;
           }
-        }
-
-        if (!Stackified && Optimize && shouldRematerialize(*DefI, TII)) {
-          ProfileGateResult Gate =
-              profileGateRematerialize(WasmST, Reg, DefI, Insert, MRI, MFI);
-          RecordProfileVeto(Gate);
-          if (Gate.Allow) {
+          break;
+        case StackifyActionKind::Rematerialize:
+          if (RematLegal && RematGate.Allow) {
             Insert = rematerializeCheapDef(
                 Reg, Use, *DefI, Insert->getIterator(), *LIS, MFI, MRI, TII);
             Stackified = true;
           }
-        }
-
-        if (!Stackified && Optimize && CanMove &&
-            oneUseDominatesOtherUses(Reg, Use, MBB, MRI, *MDT, *LIS, MFI)) {
-          ProfileGateResult Gate =
-              profileGateTee(WasmST, Reg, DefI, Insert, MRI, MFI);
-          RecordProfileVeto(Gate);
-          if (Gate.Allow) {
+          break;
+        case StackifyActionKind::Tee:
+          if (TeeLegal && TeeGate.Allow) {
             Insert = moveAndTeeForMultiUse(Reg, Use, DefI, MBB, Insert, *LIS,
                                            MFI, MRI, TII);
             Stackified = true;
           }
+          break;
+        case StackifyActionKind::KeepLocal:
+          break;
         }
 
         if (!Stackified) {
           // We failed to stackify the operand. If the problem was ordering
           // constraints, Commuting may be able to help.
-          if (SameBlock && ProfileVetoed &&
+          if (SameBlock && ProfileVetoed && !HasAllowedStackify &&
               !ProfileCommuteTried.contains(Insert) &&
               maybeProfileCommuteAfterVeto(Insert, TreeWalker, WasmST, MRI, MFI,
                                            TII, ProfileVetoReg,
                                            ProfileVetoDef)) {
             ProfileCommuteTried.insert(Insert);
             Commuting.reset();
+            Changed = true;
             continue;
           }
           if (SameBlock && ProfileVetoed)
