@@ -26,6 +26,7 @@
 #include "WebAssemblyMachineFunctionInfo.h"
 #include "WebAssemblySubtarget.h"
 #include "WebAssemblyUtilities.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/CodeGen/LiveIntervals.h"
 #include "llvm/CodeGen/MachineBlockFrequencyInfo.h"
 #include "llvm/CodeGen/MachineDominators.h"
@@ -772,6 +773,18 @@ public:
     Worklist.back() = reverse(Instr->explicit_uses());
   }
 
+  /// Restart Instr's operands from the beginning. Unlike resetTopOperands, this
+  /// also handles the case where we just popped Instr's final operand.
+  void restartOperands(MachineInstr *Instr) {
+    const iterator_range<mop_iterator> &Range = Instr->explicit_uses();
+    if (Range.empty())
+      return;
+    if (hasRemainingOperands(Instr))
+      Worklist.back() = reverse(Range);
+    else
+      Worklist.push_back(reverse(Range));
+  }
+
   /// Test whether Instr has operands remaining to be visited at the top of
   /// the stack.
   bool hasRemainingOperands(const MachineInstr *Instr) const {
@@ -905,8 +918,13 @@ static unsigned intOverflow(const WasmExecutionProfile &Profile,
 static void finishPressureForProfile(const WasmExecutionProfile &Profile,
                                      WasmExecPressureResult &R) {
   unsigned Overflow = fpOverflow(Profile, R) + intOverflow(Profile, R);
-  R.EstimatedRingSpills = Overflow;
-  R.EstimatedRingFills = Overflow;
+  if (Profile.HasRegisterRing) {
+    R.EstimatedRingSpills = Overflow;
+    R.EstimatedRingFills = Overflow;
+  } else {
+    R.EstimatedRingSpills = 0;
+    R.EstimatedRingFills = 0;
+  }
   R.Score = scorePressure(Profile, R);
 }
 
@@ -954,9 +972,8 @@ static void dumpExecutionPressure(MachineFunction &MF,
            << " peak-int=" << BBPressure.PeakInt
            << " peak-ref=" << BBPressure.PeakRef
            << " peak-v128=" << BBPressure.PeakV128 << "\n";
-    dbgs() << "    u2-ring-overflow-fp=" << fpOverflow(Profile, BBPressure)
-           << " u2-ring-overflow-int=" << intOverflow(Profile, BBPressure)
-           << "\n";
+    dbgs() << "    cap-overflow-fp=" << fpOverflow(Profile, BBPressure)
+           << " cap-overflow-int=" << intOverflow(Profile, BBPressure) << "\n";
     dbgs() << "    estimated-spills=" << BBPressure.EstimatedRingSpills
            << " estimated-fills=" << BBPressure.EstimatedRingFills << "\n";
     dbgs() << "    local.get=" << BBPressure.EstimatedLocalGets
@@ -988,11 +1005,17 @@ static bool shouldUseProfileGate(const WasmExecutionProfile &Profile,
   return true;
 }
 
-static bool profileAllowsU2Delta(const WebAssemblySubtarget &ST, Register Reg,
-                                 MachineInstr *DefI, MachineInstr *Insert,
-                                 const MachineRegisterInfo &MRI,
-                                 const WebAssemblyFunctionInfo &MFI,
-                                 StringRef Action) {
+struct ProfileGateResult {
+  bool Allow = true;
+  bool ProfileVeto = false;
+};
+
+static ProfileGateResult profileGateU2Delta(const WebAssemblySubtarget &ST,
+                                            Register Reg, MachineInstr *DefI,
+                                            MachineInstr *Insert,
+                                            const MachineRegisterInfo &MRI,
+                                            const WebAssemblyFunctionInfo &MFI,
+                                            StringRef Action) {
   const WasmExecutionProfile &Profile = ST.getExecutionProfile();
   WasmExecPressureResult Before = estimateStackifiedTreePressure(
       *Insert, MRI, MFI, WasmTuneStackifyNodeLimit);
@@ -1009,7 +1032,7 @@ static bool profileAllowsU2Delta(const WebAssemblySubtarget &ST, Register Reg,
   if (AfterOverflow > BeforeOverflow) {
     Allow = false;
     Reason = "ring-overflow";
-  } else if (AfterOverflow != 0 &&
+  } else if (!(After.HitLimit && !Before.HitLimit) && AfterOverflow != 0 &&
              After.Score > Before.Score + WasmTuneStackifyScoreHysteresis) {
     Allow = false;
     Reason = "score-delta";
@@ -1028,28 +1051,31 @@ static bool profileAllowsU2Delta(const WebAssemblySubtarget &ST, Register Reg,
              << " after-overflow=" << AfterOverflow
              << " before-score=" << Before.Score
              << " after-score=" << After.Score
+             << " before-hit-limit=" << (Before.HitLimit ? "true" : "false")
+             << " after-hit-limit=" << (After.HitLimit ? "true" : "false")
              << " hysteresis=" << WasmTuneStackifyScoreHysteresis << " def=";
       DefI->print(dbgs());
     }
   });
 
-  return Allow;
+  return {Allow, !Allow};
 }
 
-static bool profileAllowsMove(const WebAssemblySubtarget &ST, Register Reg,
-                              MachineInstr *DefI, MachineInstr *Insert,
-                              const MachineRegisterInfo &MRI,
-                              const WebAssemblyFunctionInfo &MFI) {
+static ProfileGateResult profileGateMove(const WebAssemblySubtarget &ST,
+                                         Register Reg, MachineInstr *DefI,
+                                         MachineInstr *Insert,
+                                         const MachineRegisterInfo &MRI,
+                                         const WebAssemblyFunctionInfo &MFI) {
   const WasmExecutionProfile &Profile = ST.getExecutionProfile();
   if (!shouldUseProfileGate(Profile, Insert))
-    return true;
+    return {};
 
   WasmValueClass VC = classifyWasmReg(Reg, MRI);
   if (Profile.HasRegisterRing)
-    return profileAllowsU2Delta(ST, Reg, DefI, Insert, MRI, MFI, "move");
+    return profileGateU2Delta(ST, Reg, DefI, Insert, MRI, MFI, "move");
 
   if (!Profile.HasM3SlotProviderModel)
-    return true;
+    return {};
 
   WasmExecPressureResult R = estimateStackifiedTreePressure(
       *Insert, Reg, *DefI, MRI, MFI, WasmTuneStackifyNodeLimit);
@@ -1072,49 +1098,50 @@ static bool profileAllowsMove(const WebAssemblySubtarget &ST, Register Reg,
              << " tune=" << ST.getTuneCPUName() << " action=move"
              << " reason=" << Reason << " reg=" << Reg
              << " peak-fp=" << R.PeakFP << " peak-int=" << R.PeakInt
+             << " hit-limit=" << (R.HitLimit ? "true" : "false")
              << " cap-fp=" << Profile.FPRingCapacity << " distance=" << Dist
              << " cap-int=" << Profile.IntRingCapacity << " def=";
       DefI->print(dbgs());
     }
   });
 
-  return Allow;
+  return {Allow, !Allow};
 }
 
-static bool profileAllowsRematerialize(const WebAssemblySubtarget &ST,
-                                       Register Reg, MachineInstr *DefI,
-                                       MachineInstr *Insert,
-                                       const MachineRegisterInfo &MRI,
-                                       const WebAssemblyFunctionInfo &MFI) {
+static ProfileGateResult
+profileGateRematerialize(const WebAssemblySubtarget &ST, Register Reg,
+                         MachineInstr *DefI, MachineInstr *Insert,
+                         const MachineRegisterInfo &MRI,
+                         const WebAssemblyFunctionInfo &MFI) {
   const WasmExecutionProfile &Profile = ST.getExecutionProfile();
   if (!shouldUseProfileGate(Profile, Insert))
-    return true;
+    return {};
 
   // Rematerialization clones a cheap producer next to the consumer, so the
   // original DefI distance is not relevant to m3's provider-friendly shape.
   if (Profile.HasM3SlotProviderModel)
-    return true;
+    return {};
 
   if (Profile.HasRegisterRing)
-    return profileAllowsU2Delta(ST, Reg, DefI, Insert, MRI, MFI,
-                                "rematerialize");
+    return profileGateU2Delta(ST, Reg, DefI, Insert, MRI, MFI, "rematerialize");
 
-  return true;
+  return {};
 }
 
-static bool profileAllowsTee(const WebAssemblySubtarget &ST, Register Reg,
-                             MachineInstr *DefI, MachineInstr *Insert,
-                             const MachineRegisterInfo &MRI,
-                             const WebAssemblyFunctionInfo &MFI) {
+static ProfileGateResult profileGateTee(const WebAssemblySubtarget &ST,
+                                        Register Reg, MachineInstr *DefI,
+                                        MachineInstr *Insert,
+                                        const MachineRegisterInfo &MRI,
+                                        const WebAssemblyFunctionInfo &MFI) {
   const WasmExecutionProfile &Profile = ST.getExecutionProfile();
   if (!shouldUseProfileGate(Profile, Insert))
-    return true;
+    return {};
 
   if (Profile.HasRegisterRing)
-    return profileAllowsU2Delta(ST, Reg, DefI, Insert, MRI, MFI, "tee");
+    return profileGateU2Delta(ST, Reg, DefI, Insert, MRI, MFI, "tee");
 
   if (!Profile.HasM3SlotProviderModel)
-    return true;
+    return {};
 
   WasmValueClass VC = classifyWasmReg(Reg, MRI);
   unsigned Dist = nonDebugDistance(DefI, Insert, /*Limit=*/8);
@@ -1138,12 +1165,96 @@ static bool profileAllowsTee(const WebAssemblySubtarget &ST, Register Reg,
              << " tune=" << ST.getTuneCPUName() << " action=tee"
              << " reason=" << Reason << " reg=" << Reg
              << " peak-fp=" << R.PeakFP << " peak-int=" << R.PeakInt
+             << " hit-limit=" << (R.HitLimit ? "true" : "false")
              << " distance=" << Dist << " def=";
       DefI->print(dbgs());
     }
   });
 
-  return Allow;
+  return {Allow, !Allow};
+}
+
+static WasmExecPressureResult estimatePressureForProfileCandidate(
+    MachineInstr *Insert, Register CandidateReg, MachineInstr *CandidateDef,
+    const MachineRegisterInfo &MRI, const WebAssemblyFunctionInfo &MFI,
+    const WasmExecutionProfile &Profile) {
+  WasmExecPressureResult R =
+      CandidateDef
+          ? estimateStackifiedTreePressure(*Insert, CandidateReg, *CandidateDef,
+                                           MRI, MFI, WasmTuneStackifyNodeLimit)
+          : estimateStackifiedTreePressure(*Insert, MRI, MFI,
+                                           WasmTuneStackifyNodeLimit);
+  finishPressureForProfile(Profile, R);
+  return R;
+}
+
+static bool isProfileCommuteBetter(const WasmExecutionProfile &Profile,
+                                   const WasmExecPressureResult &Before,
+                                   const WasmExecPressureResult &After) {
+  unsigned BeforeOverflow = totalOverflow(Profile, Before);
+  unsigned AfterOverflow = totalOverflow(Profile, After);
+  if (AfterOverflow != BeforeOverflow)
+    return AfterOverflow < BeforeOverflow;
+
+  if (After.HitLimit && !Before.HitLimit)
+    return false;
+
+  if (Profile.HasM3SlotProviderModel) {
+    if (After.PeakFP != Before.PeakFP)
+      return After.PeakFP < Before.PeakFP;
+    if (After.PeakInt != Before.PeakInt)
+      return After.PeakInt < Before.PeakInt;
+  }
+
+  return After.Score + WasmTuneStackifyScoreHysteresis < Before.Score;
+}
+
+static bool maybeProfileCommuteAfterVeto(
+    MachineInstr *Insert, TreeWalkerState &TreeWalker,
+    const WebAssemblySubtarget &ST, const MachineRegisterInfo &MRI,
+    const WebAssemblyFunctionInfo &MFI, const WebAssemblyInstrInfo *TII,
+    Register CandidateReg, MachineInstr *CandidateDef) {
+  const WasmExecutionProfile &Profile = ST.getExecutionProfile();
+  if (!shouldUseProfileGate(Profile, Insert))
+    return false;
+  if (Insert->isInlineAsm())
+    return false;
+
+  unsigned Operand0 = TargetInstrInfo::CommuteAnyOperandIndex;
+  unsigned Operand1 = TargetInstrInfo::CommuteAnyOperandIndex;
+  if (!TII->findCommutedOpIndices(*Insert, Operand0, Operand1))
+    return false;
+
+  WasmExecPressureResult Before = estimatePressureForProfileCandidate(
+      Insert, CandidateReg, CandidateDef, MRI, MFI, Profile);
+
+  MachineInstr *Commuted =
+      TII->commuteInstruction(*Insert, /*NewMI=*/false, Operand0, Operand1);
+  if (!Commuted)
+    return false;
+
+  WasmExecPressureResult After = estimatePressureForProfileCandidate(
+      Insert, CandidateReg, CandidateDef, MRI, MFI, Profile);
+
+  if (isProfileCommuteBetter(Profile, Before, After)) {
+    TreeWalker.restartOperands(Insert);
+    LLVM_DEBUG(dbgs() << "wasm-tune-stackify: profile-commute"
+                      << " tune=" << ST.getTuneCPUName() << " before-peak-fp="
+                      << Before.PeakFP << " before-peak-int=" << Before.PeakInt
+                      << " after-peak-fp=" << After.PeakFP
+                      << " after-peak-int=" << After.PeakInt
+                      << " before-overflow=" << totalOverflow(Profile, Before)
+                      << " after-overflow=" << totalOverflow(Profile, After)
+                      << " before-score=" << Before.Score
+                      << " after-score=" << After.Score << " before-hit-limit="
+                      << (Before.HitLimit ? "true" : "false")
+                      << " after-hit-limit="
+                      << (After.HitLimit ? "true" : "false") << "\n");
+    return true;
+  }
+
+  TII->commuteInstruction(*Insert, /*NewMI=*/false, Operand0, Operand1);
+  return false;
 }
 
 bool WebAssemblyRegStackify::runOnMachineFunction(MachineFunction &MF) {
@@ -1187,6 +1298,7 @@ bool WebAssemblyRegStackify::runOnMachineFunction(MachineFunction &MF) {
       // Iterate through the inputs in reverse order, since we'll be pulling
       // operands off the stack in LIFO order.
       CommutingState Commuting;
+      SmallPtrSet<MachineInstr *, 4> ProfileCommuteTried;
       TreeWalkerState TreeWalker(Insert);
       while (!TreeWalker.done()) {
         MachineOperand &Use = TreeWalker.pop();
@@ -1231,33 +1343,77 @@ bool WebAssemblyRegStackify::runOnMachineFunction(MachineFunction &MF) {
         bool CanMove = SameBlock &&
                        isSafeToMove(Def, &Use, Insert, MFI, MRI, Optimize) &&
                        !TreeWalker.isOnStack(Reg);
-        if (CanMove && hasSingleUse(Reg, MRI, MF, Optimize, DefI, LIS) &&
-            profileAllowsMove(WasmST, Reg, DefI, Insert, MRI, MFI)) {
-          Insert = moveForSingleUse(Reg, Use, DefI, MBB, Insert, LIS, MFI, MRI);
-
-          // If we are removing the frame base reg completely, remove the debug
-          // info as well.
-          // TODO: Encode this properly as a stackified value.
-          if (MFI.isFrameBaseVirtual() && MFI.getFrameBaseVreg() == Reg) {
-            assert(
-                Optimize &&
-                "Stackifying away frame base in unoptimized code not expected");
-            MFI.clearFrameBaseVreg();
+        bool Stackified = false;
+        bool ProfileVetoed = false;
+        Register ProfileVetoReg;
+        MachineInstr *ProfileVetoDef = nullptr;
+        auto RecordProfileVeto = [&](const ProfileGateResult &Gate) {
+          if (!Gate.ProfileVeto)
+            return;
+          ProfileVetoed = true;
+          if (!ProfileVetoDef) {
+            ProfileVetoReg = Reg;
+            ProfileVetoDef = DefI;
           }
-        } else if (Optimize && shouldRematerialize(*DefI, TII) &&
-                   profileAllowsRematerialize(WasmST, Reg, DefI, Insert, MRI,
-                                              MFI)) {
-          Insert = rematerializeCheapDef(Reg, Use, *DefI, Insert->getIterator(),
-                                         *LIS, MFI, MRI, TII);
-        } else if (Optimize && CanMove &&
-                   oneUseDominatesOtherUses(Reg, Use, MBB, MRI, *MDT, *LIS,
-                                            MFI) &&
-                   profileAllowsTee(WasmST, Reg, DefI, Insert, MRI, MFI)) {
-          Insert = moveAndTeeForMultiUse(Reg, Use, DefI, MBB, Insert, *LIS, MFI,
-                                         MRI, TII);
-        } else {
+        };
+
+        if (CanMove && hasSingleUse(Reg, MRI, MF, Optimize, DefI, LIS)) {
+          ProfileGateResult Gate =
+              profileGateMove(WasmST, Reg, DefI, Insert, MRI, MFI);
+          RecordProfileVeto(Gate);
+          if (Gate.Allow) {
+            Insert =
+                moveForSingleUse(Reg, Use, DefI, MBB, Insert, LIS, MFI, MRI);
+
+            // If we are removing the frame base reg completely, remove the
+            // debug info as well.
+            // TODO: Encode this properly as a stackified value.
+            if (MFI.isFrameBaseVirtual() && MFI.getFrameBaseVreg() == Reg) {
+              assert(Optimize && "Stackifying away frame base in unoptimized "
+                                 "code not expected");
+              MFI.clearFrameBaseVreg();
+            }
+            Stackified = true;
+          }
+        }
+
+        if (!Stackified && Optimize && shouldRematerialize(*DefI, TII)) {
+          ProfileGateResult Gate =
+              profileGateRematerialize(WasmST, Reg, DefI, Insert, MRI, MFI);
+          RecordProfileVeto(Gate);
+          if (Gate.Allow) {
+            Insert = rematerializeCheapDef(
+                Reg, Use, *DefI, Insert->getIterator(), *LIS, MFI, MRI, TII);
+            Stackified = true;
+          }
+        }
+
+        if (!Stackified && Optimize && CanMove &&
+            oneUseDominatesOtherUses(Reg, Use, MBB, MRI, *MDT, *LIS, MFI)) {
+          ProfileGateResult Gate =
+              profileGateTee(WasmST, Reg, DefI, Insert, MRI, MFI);
+          RecordProfileVeto(Gate);
+          if (Gate.Allow) {
+            Insert = moveAndTeeForMultiUse(Reg, Use, DefI, MBB, Insert, *LIS,
+                                           MFI, MRI, TII);
+            Stackified = true;
+          }
+        }
+
+        if (!Stackified) {
           // We failed to stackify the operand. If the problem was ordering
           // constraints, Commuting may be able to help.
+          if (SameBlock && ProfileVetoed &&
+              !ProfileCommuteTried.contains(Insert) &&
+              maybeProfileCommuteAfterVeto(Insert, TreeWalker, WasmST, MRI, MFI,
+                                           TII, ProfileVetoReg,
+                                           ProfileVetoDef)) {
+            ProfileCommuteTried.insert(Insert);
+            Commuting.reset();
+            continue;
+          }
+          if (SameBlock && ProfileVetoed)
+            ProfileCommuteTried.insert(Insert);
           if (!CanMove && SameBlock)
             Commuting.maybeCommute(Insert, TreeWalker, TII);
           // Proceed to the next operand.

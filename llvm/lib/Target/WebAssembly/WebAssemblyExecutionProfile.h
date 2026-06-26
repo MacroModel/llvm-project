@@ -64,6 +64,8 @@ WasmExecPressureResult estimateStackifiedTreePressure(
     const MachineRegisterInfo &MRI, const WebAssemblyFunctionInfo &MFI,
     unsigned NodeLimit);
 
+// Scores are profile-local: they are intended for before/after comparisons
+// within one execution profile, not for ranking different profiles.
 int64_t scorePressure(const WasmExecutionProfile &Profile,
                       const WasmExecPressureResult &R);
 

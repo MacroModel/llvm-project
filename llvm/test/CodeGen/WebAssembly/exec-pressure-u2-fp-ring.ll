@@ -27,11 +27,13 @@ entry:
 ; U2: wasm-exec-pressure: function=fp_pressure_call tune=u2-sysv
 ; U2: profile: fp-ring=8 int-ring=3 register-ring=true m3-slot-provider=false
 ; U2: peak-fp=10 peak-int=0
-; U2: u2-ring-overflow-fp=2 u2-ring-overflow-int=0
+; U2: cap-overflow-fp=2 cap-overflow-int=0
+; U2: estimated-spills=2 estimated-fills=2
 ; U2: function-score-sum=85
 
 ; M3: wasm-exec-pressure: function=fp_pressure_call tune=m3
 ; M3: profile: fp-ring=1 int-ring=1 register-ring=false m3-slot-provider=true
 ; M3: peak-fp=10 peak-int=0
-; M3: u2-ring-overflow-fp=9 u2-ring-overflow-int=0
+; M3: cap-overflow-fp=9 cap-overflow-int=0
+; M3: estimated-spills=0 estimated-fills=0
 ; M3: function-score-sum=83
