@@ -111,6 +111,27 @@ static bool isTeeOpcode(unsigned Opcode) {
   }
 }
 
+static bool hasOneNonDebugUse(Register Reg, const MachineRegisterInfo &MRI) {
+  bool SeenUse = false;
+  for (const MachineOperand &MO : MRI.use_nodbg_operands(Reg)) {
+    (void)MO;
+    if (SeenUse)
+      return false;
+    SeenUse = true;
+  }
+  return SeenUse;
+}
+
+static bool canSpeculativelyInspectDef(const MachineInstr &MI) {
+  if (MI.isInlineAsm() || MI.isCall())
+    return false;
+  if (MI.getNumExplicitDefs() > 1)
+    return false;
+  if (WebAssembly::isArgument(MI.getOpcode()))
+    return false;
+  return true;
+}
+
 static WasmExecPressureResult estimateStackifiedTreePressureImpl(
     MachineInstr &Root, Register CandidateReg, MachineInstr *CandidateDef,
     const MachineRegisterInfo &MRI, const WebAssemblyFunctionInfo &MFI,
@@ -157,6 +178,20 @@ static WasmExecPressureResult estimateStackifiedTreePressureImpl(
           NodeLimit - R.Nodes, /*ResultStackified=*/true, Visiting);
     } else if (MFI.isVRegStackified(Reg)) {
       if (MachineInstr *Def = MRI.getUniqueVRegDef(Reg)) {
+        Child = estimateStackifiedTreePressureImpl(
+            *Def, CandidateReg, CandidateDef, MRI, MFI, NodeLimit - R.Nodes,
+            /*ResultStackified=*/true, Visiting);
+      } else {
+        addLocalGetLeaf(Child, VC);
+      }
+    } else if (CandidateDef && ResultStackified) {
+      // While evaluating a hypothetical candidate, follow the same simple
+      // single-use expression chain RegStackify is likely to keep building.
+      // This gives u2 ring checks enough lookahead to see a wide tree before it
+      // has already been committed instruction-by-instruction.
+      if (MachineInstr *Def = MRI.getUniqueVRegDef(Reg);
+          Def && hasOneNonDebugUse(Reg, MRI) &&
+          canSpeculativelyInspectDef(*Def)) {
         Child = estimateStackifiedTreePressureImpl(
             *Def, CandidateReg, CandidateDef, MRI, MFI, NodeLimit - R.Nodes,
             /*ResultStackified=*/true, Visiting);

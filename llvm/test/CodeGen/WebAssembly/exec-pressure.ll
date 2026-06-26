@@ -31,15 +31,18 @@ entry:
 ; U2-SYSV: peak-fp=0 peak-int=5
 ; U2-SYSV: u2-ring-overflow-fp=0 u2-ring-overflow-int=2
 ; U2-SYSV: score=50
+; U2-SYSV: function-score-sum=50
 
 ; U2-AAPCS64: wasm-exec-pressure: function=pressure_i32 tune=u2-aapcs64
 ; U2-AAPCS64: profile: fp-ring=8 int-ring=5 register-ring=true m3-slot-provider=false
 ; U2-AAPCS64: peak-fp=0 peak-int=5
 ; U2-AAPCS64: u2-ring-overflow-fp=0 u2-ring-overflow-int=0
 ; U2-AAPCS64: score=30
+; U2-AAPCS64: function-score-sum=30
 
 ; M3: wasm-exec-pressure: function=pressure_f64 tune=m3
 ; M3: profile: fp-ring=1 int-ring=1 register-ring=false m3-slot-provider=true
 ; M3: peak-fp=4 peak-int=0
 ; M3: u2-ring-overflow-fp=3 u2-ring-overflow-int=0
 ; M3: score=29
+; M3: function-score-sum=29

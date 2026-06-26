@@ -54,6 +54,11 @@ static cl::opt<unsigned> WasmTuneStackifyNodeLimit(
     "wasm-tune-stackify-node-limit", cl::Hidden, cl::init(32),
     cl::desc("Maximum expression-tree nodes inspected by wasm tuning model"));
 
+static cl::opt<unsigned> WasmTuneStackifyScoreHysteresis(
+    "wasm-tune-stackify-score-hysteresis", cl::Hidden, cl::init(8),
+    cl::desc("Minimum score regression needed to veto WebAssembly "
+             "profile-aware stackification"));
+
 namespace {
 class WebAssemblyRegStackify final : public MachineFunctionPass {
   bool Optimize;
@@ -905,6 +910,11 @@ static void finishPressureForProfile(const WasmExecutionProfile &Profile,
   R.Score = scorePressure(Profile, R);
 }
 
+static unsigned totalOverflow(const WasmExecutionProfile &Profile,
+                              const WasmExecPressureResult &R) {
+  return fpOverflow(Profile, R) + intOverflow(Profile, R);
+}
+
 static void dumpExecutionPressure(MachineFunction &MF,
                                   const WebAssemblySubtarget &ST,
                                   const WebAssemblyFunctionInfo &MFI,
@@ -920,6 +930,7 @@ static void dumpExecutionPressure(MachineFunction &MF,
          << (Profile.HasM3SlotProviderModel ? "true" : "false") << "\n";
 
   WasmExecPressureResult FunctionPressure;
+  int64_t FunctionScoreSum = 0;
   for (MachineBasicBlock &MBB : MF) {
     WasmExecPressureResult BBPressure;
     for (MachineInstr &MI : MBB) {
@@ -935,6 +946,7 @@ static void dumpExecutionPressure(MachineFunction &MF,
     }
 
     finishPressureForProfile(Profile, BBPressure);
+    FunctionScoreSum += BBPressure.Score;
     addPressure(FunctionPressure, BBPressure);
 
     dbgs() << "  bb." << MBB.getNumber() << ":\n";
@@ -956,58 +968,177 @@ static void dumpExecutionPressure(MachineFunction &MF,
   }
 
   finishPressureForProfile(Profile, FunctionPressure);
-  dbgs() << "  function-score=" << FunctionPressure.Score << "\n";
+  dbgs() << "  function-peak:"
+         << " peak-fp=" << FunctionPressure.PeakFP
+         << " peak-int=" << FunctionPressure.PeakInt
+         << " peak-ref=" << FunctionPressure.PeakRef
+         << " peak-v128=" << FunctionPressure.PeakV128 << "\n";
+  dbgs() << "  function-score-sum=" << FunctionScoreSum << "\n";
 }
 
-static bool profileAllowsStackify(const WebAssemblySubtarget &ST, Register Reg,
-                                  MachineInstr *DefI, MachineInstr *Insert,
-                                  const MachineRegisterInfo &MRI,
-                                  const WebAssemblyFunctionInfo &MFI) {
-  const WasmExecutionProfile &Profile = ST.getExecutionProfile();
+static bool shouldUseProfileGate(const WasmExecutionProfile &Profile,
+                                 MachineInstr *Insert) {
   if (!WasmTuneStackify || Profile.Kind == WasmTuneKind::Generic)
-    return true;
+    return false;
   // A call's operand arity is not something RegStackify can reduce: localizing
   // a producer still leaves the call with the same number of value-stack
   // operands. Keep call-shape tuning for a later, call-aware model.
   if (Insert->isCall())
+    return false;
+  return true;
+}
+
+static bool profileAllowsU2Delta(const WebAssemblySubtarget &ST, Register Reg,
+                                 MachineInstr *DefI, MachineInstr *Insert,
+                                 const MachineRegisterInfo &MRI,
+                                 const WebAssemblyFunctionInfo &MFI,
+                                 StringRef Action) {
+  const WasmExecutionProfile &Profile = ST.getExecutionProfile();
+  WasmExecPressureResult Before = estimateStackifiedTreePressure(
+      *Insert, MRI, MFI, WasmTuneStackifyNodeLimit);
+  finishPressureForProfile(Profile, Before);
+
+  WasmExecPressureResult After = estimateStackifiedTreePressure(
+      *Insert, Reg, *DefI, MRI, MFI, WasmTuneStackifyNodeLimit);
+  finishPressureForProfile(Profile, After);
+
+  unsigned BeforeOverflow = totalOverflow(Profile, Before);
+  unsigned AfterOverflow = totalOverflow(Profile, After);
+  bool Allow = true;
+  StringRef Reason;
+  if (AfterOverflow > BeforeOverflow) {
+    Allow = false;
+    Reason = "ring-overflow";
+  } else if (AfterOverflow != 0 &&
+             After.Score > Before.Score + WasmTuneStackifyScoreHysteresis) {
+    Allow = false;
+    Reason = "score-delta";
+  }
+
+  LLVM_DEBUG({
+    if (!Allow) {
+      dbgs() << "wasm-tune-stackify: veto"
+             << " tune=" << ST.getTuneCPUName() << " action=" << Action
+             << " reason=" << Reason << " reg=" << Reg
+             << " before-peak-fp=" << Before.PeakFP
+             << " before-peak-int=" << Before.PeakInt
+             << " after-peak-fp=" << After.PeakFP
+             << " after-peak-int=" << After.PeakInt
+             << " before-overflow=" << BeforeOverflow
+             << " after-overflow=" << AfterOverflow
+             << " before-score=" << Before.Score
+             << " after-score=" << After.Score
+             << " hysteresis=" << WasmTuneStackifyScoreHysteresis << " def=";
+      DefI->print(dbgs());
+    }
+  });
+
+  return Allow;
+}
+
+static bool profileAllowsMove(const WebAssemblySubtarget &ST, Register Reg,
+                              MachineInstr *DefI, MachineInstr *Insert,
+                              const MachineRegisterInfo &MRI,
+                              const WebAssemblyFunctionInfo &MFI) {
+  const WasmExecutionProfile &Profile = ST.getExecutionProfile();
+  if (!shouldUseProfileGate(Profile, Insert))
     return true;
 
   WasmValueClass VC = classifyWasmReg(Reg, MRI);
+  if (Profile.HasRegisterRing)
+    return profileAllowsU2Delta(ST, Reg, DefI, Insert, MRI, MFI, "move");
+
+  if (!Profile.HasM3SlotProviderModel)
+    return true;
+
   WasmExecPressureResult R = estimateStackifiedTreePressure(
       *Insert, Reg, *DefI, MRI, MFI, WasmTuneStackifyNodeLimit);
   finishPressureForProfile(Profile, R);
 
   bool Allow = true;
   StringRef Reason;
-  if (Profile.HasM3SlotProviderModel) {
-    unsigned Dist = nonDebugDistance(DefI, Insert, /*Limit=*/16);
-    if (VC == WasmValueClass::FP && Dist > 4) {
-      Allow = false;
-      Reason = "m3-fp-distance";
-    } else if (VC == WasmValueClass::FP && R.PeakFP > 2) {
-      Allow = false;
-      Reason = "m3-fp-bank";
-    }
-  } else if (Profile.HasRegisterRing) {
-    if (VC == WasmValueClass::FP && Profile.FPRingCapacity &&
-        R.PeakFP > Profile.FPRingCapacity) {
-      Allow = false;
-      Reason = "fp-ring";
-    } else if (VC == WasmValueClass::Int && Profile.IntRingCapacity &&
-               R.PeakInt > Profile.IntRingCapacity) {
-      Allow = false;
-      Reason = "int-ring";
-    }
+  unsigned Dist = nonDebugDistance(DefI, Insert, /*Limit=*/16);
+  if (VC == WasmValueClass::FP && Dist > 4) {
+    Allow = false;
+    Reason = "m3-fp-distance";
+  } else if (VC == WasmValueClass::FP && R.PeakFP > 2) {
+    Allow = false;
+    Reason = "m3-fp-bank";
   }
 
   LLVM_DEBUG({
     if (!Allow) {
       dbgs() << "wasm-tune-stackify: veto"
-             << " tune=" << ST.getTuneCPUName() << " reason=" << Reason
-             << " reg=" << Reg << " peak-fp=" << R.PeakFP
-             << " peak-int=" << R.PeakInt
-             << " cap-fp=" << Profile.FPRingCapacity
+             << " tune=" << ST.getTuneCPUName() << " action=move"
+             << " reason=" << Reason << " reg=" << Reg
+             << " peak-fp=" << R.PeakFP << " peak-int=" << R.PeakInt
+             << " cap-fp=" << Profile.FPRingCapacity << " distance=" << Dist
              << " cap-int=" << Profile.IntRingCapacity << " def=";
+      DefI->print(dbgs());
+    }
+  });
+
+  return Allow;
+}
+
+static bool profileAllowsRematerialize(const WebAssemblySubtarget &ST,
+                                       Register Reg, MachineInstr *DefI,
+                                       MachineInstr *Insert,
+                                       const MachineRegisterInfo &MRI,
+                                       const WebAssemblyFunctionInfo &MFI) {
+  const WasmExecutionProfile &Profile = ST.getExecutionProfile();
+  if (!shouldUseProfileGate(Profile, Insert))
+    return true;
+
+  // Rematerialization clones a cheap producer next to the consumer, so the
+  // original DefI distance is not relevant to m3's provider-friendly shape.
+  if (Profile.HasM3SlotProviderModel)
+    return true;
+
+  if (Profile.HasRegisterRing)
+    return profileAllowsU2Delta(ST, Reg, DefI, Insert, MRI, MFI,
+                                "rematerialize");
+
+  return true;
+}
+
+static bool profileAllowsTee(const WebAssemblySubtarget &ST, Register Reg,
+                             MachineInstr *DefI, MachineInstr *Insert,
+                             const MachineRegisterInfo &MRI,
+                             const WebAssemblyFunctionInfo &MFI) {
+  const WasmExecutionProfile &Profile = ST.getExecutionProfile();
+  if (!shouldUseProfileGate(Profile, Insert))
+    return true;
+
+  if (Profile.HasRegisterRing)
+    return profileAllowsU2Delta(ST, Reg, DefI, Insert, MRI, MFI, "tee");
+
+  if (!Profile.HasM3SlotProviderModel)
+    return true;
+
+  WasmValueClass VC = classifyWasmReg(Reg, MRI);
+  unsigned Dist = nonDebugDistance(DefI, Insert, /*Limit=*/8);
+  WasmExecPressureResult R = estimateStackifiedTreePressure(
+      *Insert, Reg, *DefI, MRI, MFI, WasmTuneStackifyNodeLimit);
+  finishPressureForProfile(Profile, R);
+
+  bool Allow = true;
+  StringRef Reason;
+  if (VC == WasmValueClass::FP && Dist > 3) {
+    Allow = false;
+    Reason = "m3-tee-distance";
+  } else if (VC == WasmValueClass::FP && R.PeakFP > 2) {
+    Allow = false;
+    Reason = "m3-fp-bank";
+  }
+
+  LLVM_DEBUG({
+    if (!Allow) {
+      dbgs() << "wasm-tune-stackify: veto"
+             << " tune=" << ST.getTuneCPUName() << " action=tee"
+             << " reason=" << Reason << " reg=" << Reg
+             << " peak-fp=" << R.PeakFP << " peak-int=" << R.PeakInt
+             << " distance=" << Dist << " def=";
       DefI->print(dbgs());
     }
   });
@@ -1101,7 +1232,7 @@ bool WebAssemblyRegStackify::runOnMachineFunction(MachineFunction &MF) {
                        isSafeToMove(Def, &Use, Insert, MFI, MRI, Optimize) &&
                        !TreeWalker.isOnStack(Reg);
         if (CanMove && hasSingleUse(Reg, MRI, MF, Optimize, DefI, LIS) &&
-            profileAllowsStackify(WasmST, Reg, DefI, Insert, MRI, MFI)) {
+            profileAllowsMove(WasmST, Reg, DefI, Insert, MRI, MFI)) {
           Insert = moveForSingleUse(Reg, Use, DefI, MBB, Insert, LIS, MFI, MRI);
 
           // If we are removing the frame base reg completely, remove the debug
@@ -1114,13 +1245,14 @@ bool WebAssemblyRegStackify::runOnMachineFunction(MachineFunction &MF) {
             MFI.clearFrameBaseVreg();
           }
         } else if (Optimize && shouldRematerialize(*DefI, TII) &&
-                   profileAllowsStackify(WasmST, Reg, DefI, Insert, MRI, MFI)) {
+                   profileAllowsRematerialize(WasmST, Reg, DefI, Insert, MRI,
+                                              MFI)) {
           Insert = rematerializeCheapDef(Reg, Use, *DefI, Insert->getIterator(),
                                          *LIS, MFI, MRI, TII);
         } else if (Optimize && CanMove &&
                    oneUseDominatesOtherUses(Reg, Use, MBB, MRI, *MDT, *LIS,
                                             MFI) &&
-                   profileAllowsStackify(WasmST, Reg, DefI, Insert, MRI, MFI)) {
+                   profileAllowsTee(WasmST, Reg, DefI, Insert, MRI, MFI)) {
           Insert = moveAndTeeForMultiUse(Reg, Use, DefI, MBB, Insert, *LIS, MFI,
                                          MRI, TII);
         } else {
