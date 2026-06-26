@@ -22,6 +22,7 @@
 #include "MCTargetDesc/WebAssemblyMCTargetDesc.h" // for WebAssembly::ARGUMENT_*
 #include "WebAssembly.h"
 #include "WebAssemblyDebugValueManager.h"
+#include "WebAssemblyExecutionProfile.h"
 #include "WebAssemblyMachineFunctionInfo.h"
 #include "WebAssemblySubtarget.h"
 #include "WebAssemblyUtilities.h"
@@ -32,12 +33,26 @@
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/IR/GlobalAlias.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 #include <iterator>
 using namespace llvm;
 
 #define DEBUG_TYPE "wasm-reg-stackify"
+
+static cl::opt<bool> WasmExecPressureDump(
+    "wasm-exec-pressure-dump", cl::Hidden,
+    cl::desc("Dump WebAssembly execution-profile pressure estimates"),
+    cl::init(false));
+
+static cl::opt<bool> WasmTuneStackify(
+    "wasm-tune-stackify", cl::Hidden, cl::init(true),
+    cl::desc("Enable execution-profile-aware WebAssembly stackification"));
+
+static cl::opt<unsigned> WasmTuneStackifyNodeLimit(
+    "wasm-tune-stackify-node-limit", cl::Hidden, cl::init(32),
+    cl::desc("Maximum expression-tree nodes inspected by wasm tuning model"));
 
 namespace {
 class WebAssemblyRegStackify final : public MachineFunctionPass {
@@ -826,6 +841,180 @@ public:
 };
 } // end anonymous namespace
 
+static unsigned nonDebugDistance(const MachineInstr *From,
+                                 const MachineInstr *To, unsigned Limit) {
+  if (!From || !To || From->getParent() != To->getParent())
+    return Limit + 1;
+
+  unsigned Distance = 0;
+  for (const MachineInstr *I = From->getNextNode(); I && I != To;
+       I = I->getNextNode()) {
+    if (I->isDebugInstr())
+      continue;
+    if (++Distance > Limit)
+      return Distance;
+  }
+  return Distance;
+}
+
+static void addPressure(WasmExecPressureResult &Total,
+                        const WasmExecPressureResult &R) {
+  Total.PeakFP = std::max(Total.PeakFP, R.PeakFP);
+  Total.PeakInt = std::max(Total.PeakInt, R.PeakInt);
+  Total.PeakRef = std::max(Total.PeakRef, R.PeakRef);
+  Total.PeakV128 = std::max(Total.PeakV128, R.PeakV128);
+  Total.EstimatedLocalGets += R.EstimatedLocalGets;
+  Total.EstimatedLocalSets += R.EstimatedLocalSets;
+  Total.EstimatedTees += R.EstimatedTees;
+  Total.EstimatedDispatch += R.EstimatedDispatch;
+  Total.Nodes += R.Nodes;
+  Total.HitLimit |= R.HitLimit;
+}
+
+static bool hasStackifiedDef(const MachineInstr &MI,
+                             const WebAssemblyFunctionInfo &MFI) {
+  for (const MachineOperand &MO : MI.defs())
+    if (MO.isReg() && MO.getReg().isVirtual() &&
+        MFI.isVRegStackified(MO.getReg()))
+      return true;
+  return false;
+}
+
+static unsigned fpOverflow(const WasmExecutionProfile &Profile,
+                           const WasmExecPressureResult &R) {
+  if (!Profile.FPRingCapacity)
+    return 0;
+  return R.PeakFP > Profile.FPRingCapacity ? R.PeakFP - Profile.FPRingCapacity
+                                           : 0;
+}
+
+static unsigned intOverflow(const WasmExecutionProfile &Profile,
+                            const WasmExecPressureResult &R) {
+  if (!Profile.IntRingCapacity)
+    return 0;
+  return R.PeakInt > Profile.IntRingCapacity
+             ? R.PeakInt - Profile.IntRingCapacity
+             : 0;
+}
+
+static void finishPressureForProfile(const WasmExecutionProfile &Profile,
+                                     WasmExecPressureResult &R) {
+  unsigned Overflow = fpOverflow(Profile, R) + intOverflow(Profile, R);
+  R.EstimatedRingSpills = Overflow;
+  R.EstimatedRingFills = Overflow;
+  R.Score = scorePressure(Profile, R);
+}
+
+static void dumpExecutionPressure(MachineFunction &MF,
+                                  const WebAssemblySubtarget &ST,
+                                  const WebAssemblyFunctionInfo &MFI,
+                                  const MachineRegisterInfo &MRI) {
+  const WasmExecutionProfile &Profile = ST.getExecutionProfile();
+  dbgs() << "wasm-exec-pressure: function=" << MF.getName()
+         << " tune=" << ST.getTuneCPUName() << "\n";
+  dbgs() << "  profile:"
+         << " fp-ring=" << Profile.FPRingCapacity
+         << " int-ring=" << Profile.IntRingCapacity
+         << " register-ring=" << (Profile.HasRegisterRing ? "true" : "false")
+         << " m3-slot-provider="
+         << (Profile.HasM3SlotProviderModel ? "true" : "false") << "\n";
+
+  WasmExecPressureResult FunctionPressure;
+  for (MachineBasicBlock &MBB : MF) {
+    WasmExecPressureResult BBPressure;
+    for (MachineInstr &MI : MBB) {
+      if (MI.isDebugInstr() || MI.isPosition())
+        continue;
+      // Stackified defs are accounted for by the instruction that consumes
+      // them, which keeps the dump focused on completed expression roots.
+      if (hasStackifiedDef(MI, MFI))
+        continue;
+      WasmExecPressureResult R = estimateStackifiedTreePressure(
+          MI, MRI, MFI, WasmTuneStackifyNodeLimit);
+      addPressure(BBPressure, R);
+    }
+
+    finishPressureForProfile(Profile, BBPressure);
+    addPressure(FunctionPressure, BBPressure);
+
+    dbgs() << "  bb." << MBB.getNumber() << ":\n";
+    dbgs() << "    peak-fp=" << BBPressure.PeakFP
+           << " peak-int=" << BBPressure.PeakInt
+           << " peak-ref=" << BBPressure.PeakRef
+           << " peak-v128=" << BBPressure.PeakV128 << "\n";
+    dbgs() << "    u2-ring-overflow-fp=" << fpOverflow(Profile, BBPressure)
+           << " u2-ring-overflow-int=" << intOverflow(Profile, BBPressure)
+           << "\n";
+    dbgs() << "    estimated-spills=" << BBPressure.EstimatedRingSpills
+           << " estimated-fills=" << BBPressure.EstimatedRingFills << "\n";
+    dbgs() << "    local.get=" << BBPressure.EstimatedLocalGets
+           << " local.set=" << BBPressure.EstimatedLocalSets
+           << " tee=" << BBPressure.EstimatedTees
+           << " dispatch=" << BBPressure.EstimatedDispatch << "\n";
+    dbgs() << "    score=" << BBPressure.Score << " nodes=" << BBPressure.Nodes
+           << " hit-limit=" << (BBPressure.HitLimit ? "true" : "false") << "\n";
+  }
+
+  finishPressureForProfile(Profile, FunctionPressure);
+  dbgs() << "  function-score=" << FunctionPressure.Score << "\n";
+}
+
+static bool profileAllowsStackify(const WebAssemblySubtarget &ST, Register Reg,
+                                  MachineInstr *DefI, MachineInstr *Insert,
+                                  const MachineRegisterInfo &MRI,
+                                  const WebAssemblyFunctionInfo &MFI) {
+  const WasmExecutionProfile &Profile = ST.getExecutionProfile();
+  if (!WasmTuneStackify || Profile.Kind == WasmTuneKind::Generic)
+    return true;
+  // A call's operand arity is not something RegStackify can reduce: localizing
+  // a producer still leaves the call with the same number of value-stack
+  // operands. Keep call-shape tuning for a later, call-aware model.
+  if (Insert->isCall())
+    return true;
+
+  WasmValueClass VC = classifyWasmReg(Reg, MRI);
+  WasmExecPressureResult R = estimateStackifiedTreePressure(
+      *Insert, Reg, *DefI, MRI, MFI, WasmTuneStackifyNodeLimit);
+  finishPressureForProfile(Profile, R);
+
+  bool Allow = true;
+  StringRef Reason;
+  if (Profile.HasM3SlotProviderModel) {
+    unsigned Dist = nonDebugDistance(DefI, Insert, /*Limit=*/16);
+    if (VC == WasmValueClass::FP && Dist > 4) {
+      Allow = false;
+      Reason = "m3-fp-distance";
+    } else if (VC == WasmValueClass::FP && R.PeakFP > 2) {
+      Allow = false;
+      Reason = "m3-fp-bank";
+    }
+  } else if (Profile.HasRegisterRing) {
+    if (VC == WasmValueClass::FP && Profile.FPRingCapacity &&
+        R.PeakFP > Profile.FPRingCapacity) {
+      Allow = false;
+      Reason = "fp-ring";
+    } else if (VC == WasmValueClass::Int && Profile.IntRingCapacity &&
+               R.PeakInt > Profile.IntRingCapacity) {
+      Allow = false;
+      Reason = "int-ring";
+    }
+  }
+
+  LLVM_DEBUG({
+    if (!Allow) {
+      dbgs() << "wasm-tune-stackify: veto"
+             << " tune=" << ST.getTuneCPUName() << " reason=" << Reason
+             << " reg=" << Reg << " peak-fp=" << R.PeakFP
+             << " peak-int=" << R.PeakInt
+             << " cap-fp=" << Profile.FPRingCapacity
+             << " cap-int=" << Profile.IntRingCapacity << " def=";
+      DefI->print(dbgs());
+    }
+  });
+
+  return Allow;
+}
+
 bool WebAssemblyRegStackify::runOnMachineFunction(MachineFunction &MF) {
   LLVM_DEBUG(dbgs() << "********** Register Stackifying **********\n"
                        "********** Function: "
@@ -834,7 +1023,8 @@ bool WebAssemblyRegStackify::runOnMachineFunction(MachineFunction &MF) {
   bool Changed = false;
   MachineRegisterInfo &MRI = MF.getRegInfo();
   WebAssemblyFunctionInfo &MFI = *MF.getInfo<WebAssemblyFunctionInfo>();
-  const auto *TII = MF.getSubtarget<WebAssemblySubtarget>().getInstrInfo();
+  const auto &WasmST = MF.getSubtarget<WebAssemblySubtarget>();
+  const auto *TII = WasmST.getInstrInfo();
   MachineDominatorTree *MDT = nullptr;
   LiveIntervals *LIS = nullptr;
   if (Optimize) {
@@ -910,7 +1100,8 @@ bool WebAssemblyRegStackify::runOnMachineFunction(MachineFunction &MF) {
         bool CanMove = SameBlock &&
                        isSafeToMove(Def, &Use, Insert, MFI, MRI, Optimize) &&
                        !TreeWalker.isOnStack(Reg);
-        if (CanMove && hasSingleUse(Reg, MRI, MF, Optimize, DefI, LIS)) {
+        if (CanMove && hasSingleUse(Reg, MRI, MF, Optimize, DefI, LIS) &&
+            profileAllowsStackify(WasmST, Reg, DefI, Insert, MRI, MFI)) {
           Insert = moveForSingleUse(Reg, Use, DefI, MBB, Insert, LIS, MFI, MRI);
 
           // If we are removing the frame base reg completely, remove the debug
@@ -922,12 +1113,14 @@ bool WebAssemblyRegStackify::runOnMachineFunction(MachineFunction &MF) {
                 "Stackifying away frame base in unoptimized code not expected");
             MFI.clearFrameBaseVreg();
           }
-        } else if (Optimize && shouldRematerialize(*DefI, TII)) {
+        } else if (Optimize && shouldRematerialize(*DefI, TII) &&
+                   profileAllowsStackify(WasmST, Reg, DefI, Insert, MRI, MFI)) {
           Insert = rematerializeCheapDef(Reg, Use, *DefI, Insert->getIterator(),
                                          *LIS, MFI, MRI, TII);
         } else if (Optimize && CanMove &&
                    oneUseDominatesOtherUses(Reg, Use, MBB, MRI, *MDT, *LIS,
-                                            MFI)) {
+                                            MFI) &&
+                   profileAllowsStackify(WasmST, Reg, DefI, Insert, MRI, MFI)) {
           Insert = moveAndTeeForMultiUse(Reg, Use, DefI, MBB, Insert, *LIS, MFI,
                                          MRI, TII);
         } else {
@@ -988,6 +1181,9 @@ bool WebAssemblyRegStackify::runOnMachineFunction(MachineFunction &MF) {
     for (MachineBasicBlock &MBB : MF)
       MBB.addLiveIn(WebAssembly::VALUE_STACK);
   }
+
+  if (WasmExecPressureDump)
+    dumpExecutionPressure(MF, WasmST, MFI, MRI);
 
 #ifndef NDEBUG
   // Verify that pushes and pops are performed in LIFO order.
