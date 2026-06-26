@@ -1108,6 +1108,37 @@ static bool isReassocFPProductBankNode(const MachineInstr *MI,
   return isReassocFPProductBankNodeImpl(MI, MRI, /*Limit=*/16, Visiting);
 }
 
+static unsigned countReassocFPProductBankProductsImpl(
+    const MachineInstr *MI, const MachineRegisterInfo &MRI, unsigned Limit,
+    SmallPtrSetImpl<const MachineInstr *> &Visiting) {
+  if (!MI || !MI->getFlag(MachineInstr::FmReassoc))
+    return 0;
+  if (isFPMulOpcode(MI->getOpcode()))
+    return 1;
+  if (!isFPAddOpcode(MI->getOpcode()) || Limit == 0)
+    return 0;
+  if (!Visiting.insert(MI).second)
+    return 0;
+
+  unsigned Products = 0;
+  for (const MachineOperand &MO : MI->explicit_uses()) {
+    if (!MO.isReg() || !MO.getReg().isVirtual())
+      continue;
+    Products += countReassocFPProductBankProductsImpl(
+        MRI.getUniqueVRegDef(MO.getReg()), MRI, Limit - 1, Visiting);
+  }
+
+  Visiting.erase(MI);
+  return Products;
+}
+
+static unsigned countReassocFPProductBankProducts(
+    const MachineInstr *MI, const MachineRegisterInfo &MRI) {
+  SmallPtrSet<const MachineInstr *, 16> Visiting;
+  return countReassocFPProductBankProductsImpl(MI, MRI, /*Limit=*/16,
+                                               Visiting);
+}
+
 static bool isReassocFPProductBankEdge(Register Reg, MachineInstr *DefI,
                                        MachineInstr *Insert,
                                        const MachineRegisterInfo &MRI) {
@@ -1128,6 +1159,13 @@ static bool shouldPreferProductBankBoundary(
   if (!Profile.HasRegisterRing || !Profile.FPRingCapacity)
     return false;
   if (!isReassocFPProductBankEdge(Reg, DefI, Insert, MRI))
+    return false;
+  // A plus-accumulator/product-bank shape normally uses one lane for the
+  // incoming accumulator and the rest for product producers. Avoid treating
+  // smaller trees as bank-width boundaries just because the estimator's peak
+  // includes transient add operands.
+  if (countReassocFPProductBankProducts(DefI, MRI) + 1 <
+      Profile.PreferredFPBank)
     return false;
   return StackifiedPressure.PeakFP >= Profile.PreferredFPBank;
 }
