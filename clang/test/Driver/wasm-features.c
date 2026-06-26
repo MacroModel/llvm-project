@@ -11,6 +11,20 @@
 // GENERIC: "-target-cpu" "generic"
 // BLEEDING-EDGE: "-target-cpu" "bleeding-edge"
 
+// RUN: %clang --target=wasm32-unknown-unknown -### %s -mcpu=mvp -mtune=u2-aapcs64 2>&1 | FileCheck %s -check-prefix=U2-AAPCS64
+// RUN: %clang --target=wasm32-unknown-unknown -### %s -mcpu=mvp -mtune=u2-sysv 2>&1 | FileCheck %s -check-prefix=U2-SYSV
+// RUN: %clang --target=wasm32-unknown-unknown -### %s -mcpu=mvp -mtune=u2-x86_64-sysv 2>&1 | FileCheck %s -check-prefix=U2-X86-64-SYSV
+// RUN: %clang --target=wasm32-unknown-unknown -### %s -mcpu=mvp -mtune=m3 2>&1 | FileCheck %s -check-prefix=M3
+
+// U2-AAPCS64: "-target-cpu" "mvp"
+// U2-AAPCS64-SAME: "-tune-cpu" "u2-aapcs64"
+// U2-SYSV: "-target-cpu" "mvp"
+// U2-SYSV-SAME: "-tune-cpu" "u2-sysv"
+// U2-X86-64-SYSV: "-target-cpu" "mvp"
+// U2-X86-64-SYSV-SAME: "-tune-cpu" "u2-x86_64-sysv"
+// M3: "-target-cpu" "mvp"
+// M3-SAME: "-tune-cpu" "m3"
+
 // RUN: %clang --target=wasm32-unknown-unknown -### %s -matomics 2>&1 | FileCheck %s -check-prefix=ATOMICS
 // RUN: %clang --target=wasm32-unknown-unknown -### %s -mno-atomics 2>&1 | FileCheck %s -check-prefix=NO-ATOMICS
 

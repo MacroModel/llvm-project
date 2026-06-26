@@ -20,6 +20,7 @@
 #include "WebAssemblyTargetObjectFile.h"
 #include "WebAssemblyTargetTransformInfo.h"
 #include "WebAssemblyUtilities.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/CodeGen/GlobalISel/IRTranslator.h"
 #include "llvm/CodeGen/GlobalISel/InstructionSelect.h"
 #include "llvm/CodeGen/GlobalISel/Legalizer.h"
@@ -226,15 +227,29 @@ WebAssemblyTargetMachine::~WebAssemblyTargetMachine() = default; // anchor.
 
 const WebAssemblySubtarget *WebAssemblyTargetMachine::getSubtargetImpl() const {
   return getSubtargetImpl(std::string(getTargetCPU()),
+                          std::string(getTargetCPU()),
                           std::string(getTargetFeatureString()));
 }
 
 const WebAssemblySubtarget *
-WebAssemblyTargetMachine::getSubtargetImpl(std::string CPU,
+WebAssemblyTargetMachine::getSubtargetImpl(std::string CPU, std::string TuneCPU,
                                            std::string FS) const {
-  auto &I = SubtargetMap[CPU + FS];
+  if (CPU.empty())
+    CPU = "generic";
+  if (TuneCPU.empty())
+    TuneCPU = CPU;
+
+  SmallString<256> Key;
+  Key += CPU;
+  Key += '\0';
+  Key += TuneCPU;
+  Key += '\0';
+  Key += FS;
+
+  auto &I = SubtargetMap[Key.str()];
   if (!I) {
-    I = std::make_unique<WebAssemblySubtarget>(TargetTriple, CPU, FS, *this);
+    I = std::make_unique<WebAssemblySubtarget>(TargetTriple, CPU, TuneCPU, FS,
+                                               *this);
   }
   return I.get();
 }
@@ -242,14 +257,17 @@ WebAssemblyTargetMachine::getSubtargetImpl(std::string CPU,
 const WebAssemblySubtarget *
 WebAssemblyTargetMachine::getSubtargetImpl(const Function &F) const {
   Attribute CPUAttr = F.getFnAttribute("target-cpu");
+  Attribute TuneAttr = F.getFnAttribute("tune-cpu");
   Attribute FSAttr = F.getFnAttribute("target-features");
 
   std::string CPU =
       CPUAttr.isValid() ? CPUAttr.getValueAsString().str() : TargetCPU;
+  std::string TuneCPU = TuneAttr.isValid() ? TuneAttr.getValueAsString().str()
+                                           : (CPU.empty() ? "generic" : CPU);
   std::string FS =
       FSAttr.isValid() ? FSAttr.getValueAsString().str() : TargetFS;
 
-  return getSubtargetImpl(CPU, FS);
+  return getSubtargetImpl(CPU, TuneCPU, FS);
 }
 
 namespace {
@@ -324,6 +342,7 @@ private:
       Features =
           WasmTM
               ->getSubtargetImpl(std::string(WasmTM->getTargetCPU()),
+                                 std::string(WasmTM->getTargetCPU()),
                                  std::string(WasmTM->getTargetFeatureString()))
               ->getFeatureBits();
     }

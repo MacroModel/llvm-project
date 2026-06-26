@@ -166,6 +166,18 @@
 // RUN: %clang -E -dM %s -o - 2>&1 \
 // RUN:     -target wasm64-unknown-unknown -mcpu=mvp \
 // RUN:   | FileCheck %s -check-prefix=MVP
+// RUN: %clang -E -dM %s -o - 2>&1 \
+// RUN:     -target wasm32-unknown-unknown -mcpu=u2-aapcs64 \
+// RUN:   | FileCheck %s -check-prefix=MVP
+// RUN: %clang -E -dM %s -o - 2>&1 \
+// RUN:     -target wasm32-unknown-unknown -mcpu=u2-sysv \
+// RUN:   | FileCheck %s -check-prefix=MVP
+// RUN: %clang -E -dM %s -o - 2>&1 \
+// RUN:     -target wasm32-unknown-unknown -mcpu=u2-x86_64-sysv \
+// RUN:   | FileCheck %s -check-prefix=MVP
+// RUN: %clang -E -dM %s -o - 2>&1 \
+// RUN:     -target wasm32-unknown-unknown -mcpu=m3 \
+// RUN:   | FileCheck %s -check-prefix=MVP
 //
 // MVP-NOT: #define __wasm_atomics__ 1{{$}}
 // MVP-NOT: #define __wasm_bulk_memory__ 1{{$}}

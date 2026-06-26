@@ -29,16 +29,70 @@ using namespace llvm;
 #define GET_SUBTARGETINFO_TARGET_DESC
 #include "WebAssemblyGenSubtargetInfo.inc"
 
-WebAssemblySubtarget &
-WebAssemblySubtarget::initializeSubtargetDependencies(StringRef CPU,
-                                                      StringRef FS) {
+static WasmExecutionProfile computeExecutionProfile(StringRef TuneCPU) {
+  WasmExecutionProfile Profile;
+
+  if (TuneCPU == "u2-aapcs64") {
+    Profile.Kind = WasmTuneKind::U2AAPCS64;
+    Profile.HasRegisterRing = true;
+    Profile.FPRingCapacity = 8;
+    Profile.IntRingCapacity = 5;
+    Profile.PreferredFPBank = 8;
+    Profile.PreferredIntBank = 5;
+    Profile.SpillCost = 5;
+    Profile.FillCost = 5;
+    return Profile;
+  }
+
+  if (TuneCPU == "u2-sysv" || TuneCPU == "u2-x86_64-sysv") {
+    Profile.Kind = WasmTuneKind::U2SysV;
+    Profile.HasRegisterRing = true;
+    Profile.FPRingCapacity = 8;
+    Profile.IntRingCapacity = 3;
+    Profile.PreferredFPBank = 8;
+    Profile.PreferredIntBank = 3;
+    Profile.SpillCost = 5;
+    Profile.FillCost = 5;
+    return Profile;
+  }
+
+  if (TuneCPU == "m3") {
+    Profile.Kind = WasmTuneKind::M3;
+    Profile.HasM3SlotProviderModel = true;
+    Profile.FPRingCapacity = 1;
+    Profile.IntRingCapacity = 1;
+    Profile.PreferredFPBank = 1;
+    Profile.PreferredIntBank = 1;
+    Profile.LocalGetCost = 1;
+    Profile.LocalSetCost = 1;
+    Profile.SpillCost = 2;
+    Profile.FillCost = 2;
+    return Profile;
+  }
+
+  return Profile;
+}
+
+WebAssemblySubtarget &WebAssemblySubtarget::initializeSubtargetDependencies(
+    StringRef CPU, StringRef TuneCPU, StringRef FS) {
   // Determine default and user-specified characteristics
   LLVM_DEBUG(llvm::dbgs() << "initializeSubtargetDependencies\n");
 
   if (CPU.empty())
     CPU = "generic";
+  if (TuneCPU.empty())
+    TuneCPU = CPU;
 
+  // Feature legality is controlled by CPU/FS. TuneCPU only selects backend
+  // execution-profile heuristics and must not enable post-MVP features.
   ParseSubtargetFeatures(CPU, /*TuneCPU*/ CPU, FS);
+  TuneCPUName = TuneCPU.str();
+  ExecProfile = computeExecutionProfile(TuneCPU);
+
+  LLVM_DEBUG(llvm::dbgs() << "  cpu=" << CPU << " tune-cpu=" << TuneCPU
+                          << " fp-ring=" << ExecProfile.FPRingCapacity
+                          << " int-ring=" << ExecProfile.IntRingCapacity
+                          << "\n");
 
   // WASIP3 uses cooperative multithreading, which implies using libcall
   // thread context.
@@ -74,10 +128,12 @@ WebAssemblySubtarget::initializeSubtargetDependencies(StringRef CPU,
 
 WebAssemblySubtarget::WebAssemblySubtarget(const Triple &TT,
                                            const std::string &CPU,
+                                           const std::string &TuneCPU,
                                            const std::string &FS,
                                            const TargetMachine &TM)
-    : WebAssemblyGenSubtargetInfo(TT, CPU, /*TuneCPU*/ CPU, FS),
-      TargetTriple(TT), InstrInfo(initializeSubtargetDependencies(CPU, FS)),
+    : WebAssemblyGenSubtargetInfo(TT, CPU, TuneCPU.empty() ? CPU : TuneCPU, FS),
+      TargetTriple(TT),
+      InstrInfo(initializeSubtargetDependencies(CPU, TuneCPU, FS)),
       TLInfo(TM, *this) {
   CallLoweringInfo.reset(new WebAssemblyCallLowering(*getTargetLowering()));
   Legalizer.reset(new WebAssemblyLegalizerInfo(*this));

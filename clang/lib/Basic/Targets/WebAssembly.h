@@ -144,6 +144,8 @@ private:
 
   bool isValidCPUName(StringRef Name) const final;
   void fillValidCPUList(SmallVectorImpl<StringRef> &Values) const final;
+  bool isValidTuneCPUName(StringRef Name) const final;
+  void fillValidTuneCPUList(SmallVectorImpl<StringRef> &Values) const final;
 
   bool setCPU(StringRef Name) final { return isValidCPUName(Name); }
 

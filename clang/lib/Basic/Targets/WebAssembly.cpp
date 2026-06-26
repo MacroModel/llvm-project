@@ -38,7 +38,12 @@ static constexpr auto BuiltinInfos = Builtin::MakeInfos<NumBuiltins>({
 });
 
 static constexpr llvm::StringLiteral ValidCPUNames[] = {
-    {"mvp"}, {"bleeding-edge"}, {"generic"}, {"lime1"}};
+    {"mvp"},        {"bleeding-edge"}, {"generic"},        {"lime1"},
+    {"u2-aapcs64"}, {"u2-sysv"},       {"u2-x86_64-sysv"}, {"m3"}};
+
+static constexpr llvm::StringLiteral ValidTuneCPUNames[] = {
+    {"mvp"},        {"bleeding-edge"}, {"generic"},        {"lime1"},
+    {"u2-aapcs64"}, {"u2-sysv"},       {"u2-x86_64-sysv"}, {"m3"}};
 
 StringRef WebAssemblyTargetInfo::getABI() const { return ABI; }
 
@@ -82,6 +87,15 @@ bool WebAssemblyTargetInfo::isValidCPUName(StringRef Name) const {
 void WebAssemblyTargetInfo::fillValidCPUList(
     SmallVectorImpl<StringRef> &Values) const {
   Values.append(std::begin(ValidCPUNames), std::end(ValidCPUNames));
+}
+
+bool WebAssemblyTargetInfo::isValidTuneCPUName(StringRef Name) const {
+  return llvm::is_contained(ValidTuneCPUNames, Name);
+}
+
+void WebAssemblyTargetInfo::fillValidTuneCPUList(
+    SmallVectorImpl<StringRef> &Values) const {
+  Values.append(std::begin(ValidTuneCPUNames), std::end(ValidTuneCPUNames));
 }
 
 void WebAssemblyTargetInfo::getTargetDefines(const LangOptions &Opts,

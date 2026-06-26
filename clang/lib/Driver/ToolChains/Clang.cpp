@@ -2298,6 +2298,11 @@ void Clang::AddWebAssemblyTargetArgs(const ArgList &Args,
   if (!Args.hasArg(options::OPT_fvisibility_EQ,
                    options::OPT_fvisibility_ms_compat))
     CmdArgs.push_back("-fvisibility=hidden");
+
+  if (const Arg *A = Args.getLastArg(options::OPT_mtune_EQ)) {
+    CmdArgs.push_back("-tune-cpu");
+    CmdArgs.push_back(A->getValue());
+  }
 }
 
 void Clang::AddVETargetArgs(const ArgList &Args, ArgStringList &CmdArgs) const {

@@ -130,6 +130,13 @@ def WebAssemblyInstrInfo : InstrInfo;
 // Minimal Viable Product.
 def : ProcessorModel<"mvp", NoSchedModel, []>;
 
+// Execution-tuned profiles. These do not enable any WebAssembly features; they
+// only select backend layout and scheduling heuristics.
+def : ProcessorModel<"u2-aapcs64", NoSchedModel, []>;
+def : ProcessorModel<"u2-sysv", NoSchedModel, []>;
+def : ProcessorModel<"u2-x86_64-sysv", NoSchedModel, []>;
+def : ProcessorModel<"m3", NoSchedModel, []>;
+
 // Generic processor: latest stable version.
 //
 // This includes features that have achieved phase 4 of the standards process,
