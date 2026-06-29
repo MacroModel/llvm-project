@@ -32,11 +32,16 @@ using namespace llvm;
 static WasmExecutionProfile computeExecutionProfile(StringRef TuneCPU) {
   WasmExecutionProfile Profile;
 
-  if (TuneCPU == "u2-aapcs64") {
+  if (TuneCPU == "u2-aapcs64" || TuneCPU == "uwvm2-aapcs64" ||
+      TuneCPU == "uwvm2-aarch64-aapcs64") {
     Profile.Kind = WasmTuneKind::U2AAPCS64;
     Profile.HasRegisterRing = true;
+    Profile.HasUWVM2RegisterRingModel = true;
     Profile.FPRingCapacity = 8;
     Profile.IntRingCapacity = 5;
+    Profile.IntTuningBoundary = 5;
+    if (TuneCPU.starts_with("uwvm2"))
+      Profile.StrictFPAccumBoundary = 2;
     Profile.PreferredFPBank = 8;
     Profile.PreferredIntBank = 5;
     Profile.SpillCost = 5;
@@ -47,10 +52,32 @@ static WasmExecutionProfile computeExecutionProfile(StringRef TuneCPU) {
   if (TuneCPU == "u2-sysv" || TuneCPU == "u2-x86_64-sysv") {
     Profile.Kind = WasmTuneKind::U2SysV;
     Profile.HasRegisterRing = true;
+    Profile.HasUWVM2RegisterRingModel = true;
     Profile.FPRingCapacity = 8;
     Profile.IntRingCapacity = 3;
+    Profile.IntTuningBoundary = 5;
+    Profile.StrictFPAccumBoundary = 2;
     Profile.PreferredFPBank = 8;
-    Profile.PreferredIntBank = 3;
+    Profile.PreferredIntBank = 5;
+    Profile.SpillCost = 5;
+    Profile.FillCost = 5;
+    return Profile;
+  }
+
+  if (TuneCPU == "uwvm2" || TuneCPU == "uwvm2-int" ||
+      TuneCPU == "uwvm2-sysv" || TuneCPU == "uwvm2-x86_64-sysv") {
+    Profile.Kind = WasmTuneKind::U2SysV;
+    Profile.HasRegisterRing = true;
+    Profile.HasUWVM2RegisterRingModel = true;
+    Profile.FPRingCapacity = 8;
+    Profile.IntRingCapacity = 3;
+    // UWVM2's delay_local and register-ring translator can absorb a little
+    // more transient integer stack pressure than the physical SysV ring before
+    // extra local traffic becomes profitable.
+    Profile.IntTuningBoundary = 5;
+    Profile.StrictFPAccumBoundary = 2;
+    Profile.PreferredFPBank = 8;
+    Profile.PreferredIntBank = 5;
     Profile.SpillCost = 5;
     Profile.FillCost = 5;
     return Profile;

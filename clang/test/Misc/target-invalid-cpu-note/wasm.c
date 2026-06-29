@@ -12,6 +12,12 @@
 // CHECK-SAME: {{^}}, u2-aapcs64
 // CHECK-SAME: {{^}}, u2-sysv
 // CHECK-SAME: {{^}}, u2-x86_64-sysv
+// CHECK-SAME: {{^}}, uwvm2
+// CHECK-SAME: {{^}}, uwvm2-int
+// CHECK-SAME: {{^}}, uwvm2-aapcs64
+// CHECK-SAME: {{^}}, uwvm2-aarch64-aapcs64
+// CHECK-SAME: {{^}}, uwvm2-sysv
+// CHECK-SAME: {{^}}, uwvm2-x86_64-sysv
 // CHECK-SAME: {{^}}, m3
 // CHECK-SAME: {{$}}
 
@@ -25,5 +31,11 @@
 // TUNE-SAME: {{^}}, u2-aapcs64
 // TUNE-SAME: {{^}}, u2-sysv
 // TUNE-SAME: {{^}}, u2-x86_64-sysv
+// TUNE-SAME: {{^}}, uwvm2
+// TUNE-SAME: {{^}}, uwvm2-int
+// TUNE-SAME: {{^}}, uwvm2-aapcs64
+// TUNE-SAME: {{^}}, uwvm2-aarch64-aapcs64
+// TUNE-SAME: {{^}}, uwvm2-sysv
+// TUNE-SAME: {{^}}, uwvm2-x86_64-sysv
 // TUNE-SAME: {{^}}, m3
 // TUNE-SAME: {{$}}

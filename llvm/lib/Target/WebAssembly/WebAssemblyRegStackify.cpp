@@ -37,6 +37,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
+#include <cstdint>
 #include <iterator>
 #include <limits>
 using namespace llvm;
@@ -51,6 +52,10 @@ static cl::opt<bool> WasmExecPressureDump(
 static cl::opt<bool> WasmTuneStackify(
     "wasm-tune-stackify", cl::Hidden, cl::init(true),
     cl::desc("Enable execution-profile-aware WebAssembly stackification"));
+
+static cl::opt<bool> WasmTuneShapeDump(
+    "wasm-tune-shape-dump", cl::Hidden, cl::init(false),
+    cl::desc("Dump WebAssembly RegStackify tuning shape counters"));
 
 static cl::opt<unsigned> WasmTuneStackifyNodeLimit(
     "wasm-tune-stackify-node-limit", cl::Hidden, cl::init(32),
@@ -916,6 +921,44 @@ static unsigned intOverflow(const WasmExecutionProfile &Profile,
              : 0;
 }
 
+static unsigned tuningIntBoundaryCap(const WasmExecutionProfile &Profile) {
+  if (!Profile.IntRingCapacity)
+    return 0;
+  if (Profile.IntTuningBoundary)
+    return Profile.IntTuningBoundary;
+  return Profile.IntRingCapacity;
+}
+
+static unsigned tuningIntOverflow(const WasmExecutionProfile &Profile,
+                                  const WasmExecPressureResult &R) {
+  unsigned Cap = tuningIntBoundaryCap(Profile);
+  if (!Cap)
+    return 0;
+  return R.PeakInt > Cap ? R.PeakInt - Cap : 0;
+}
+
+static int64_t scorePressureForTuning(const WasmExecutionProfile &Profile,
+                                      const WasmExecPressureResult &R) {
+  int64_t Score = 0;
+
+  Score += int64_t(Profile.DispatchCost) * R.EstimatedDispatch;
+  Score += int64_t(Profile.LocalGetCost) * R.EstimatedLocalGets;
+  Score += int64_t(Profile.LocalSetCost) * R.EstimatedLocalSets;
+  Score += int64_t(Profile.TeeCost) * R.EstimatedTees;
+
+  if (Profile.HasRegisterRing) {
+    unsigned Overflow = fpOverflow(Profile, R) + tuningIntOverflow(Profile, R);
+    Score += int64_t(Profile.SpillCost + Profile.FillCost) * Overflow;
+  }
+
+  if (Profile.HasM3SlotProviderModel) {
+    Score += int64_t(R.PeakFP > 1 ? (R.PeakFP - 1) * 4 : 0);
+    Score += int64_t(R.PeakInt > 1 ? (R.PeakInt - 1) * 2 : 0);
+  }
+
+  return Score;
+}
+
 static void finishPressureForProfile(const WasmExecutionProfile &Profile,
                                      WasmExecPressureResult &R) {
   unsigned Overflow = fpOverflow(Profile, R) + intOverflow(Profile, R);
@@ -929,9 +972,27 @@ static void finishPressureForProfile(const WasmExecutionProfile &Profile,
   R.Score = scorePressure(Profile, R);
 }
 
+static void finishPressureForTuning(const WasmExecutionProfile &Profile,
+                                    WasmExecPressureResult &R) {
+  unsigned Overflow = fpOverflow(Profile, R) + tuningIntOverflow(Profile, R);
+  if (Profile.HasRegisterRing) {
+    R.EstimatedRingSpills = Overflow;
+    R.EstimatedRingFills = Overflow;
+  } else {
+    R.EstimatedRingSpills = 0;
+    R.EstimatedRingFills = 0;
+  }
+  R.Score = scorePressureForTuning(Profile, R);
+}
+
 static unsigned totalOverflow(const WasmExecutionProfile &Profile,
                               const WasmExecPressureResult &R) {
   return fpOverflow(Profile, R) + intOverflow(Profile, R);
+}
+
+static unsigned totalTuningOverflow(const WasmExecutionProfile &Profile,
+                                    const WasmExecPressureResult &R) {
+  return fpOverflow(Profile, R) + tuningIntOverflow(Profile, R);
 }
 
 static void dumpExecutionPressure(MachineFunction &MF,
@@ -1009,6 +1070,17 @@ static bool shouldUseProfileGate(const WasmExecutionProfile &Profile,
 struct ProfileGateResult {
   bool Allow = true;
   bool ProfileVeto = false;
+  enum VetoReason {
+    None,
+    RingOverflow,
+    ScoreDelta,
+    M3FPDistance,
+    M3FPBank,
+    M3TeeDistance,
+    UWVM2StrictFPAccum,
+  } Reason = None;
+  unsigned AfterPeakFP = 0;
+  unsigned AfterPeakInt = 0;
 };
 
 enum class StackifyActionKind {
@@ -1025,6 +1097,31 @@ struct StackifyActionCandidate {
   int64_t Score = std::numeric_limits<int64_t>::max();
 };
 
+struct WasmTuneShapeStats {
+  uint64_t Move = 0;
+  uint64_t Rematerialize = 0;
+  uint64_t Tee = 0;
+  uint64_t KeepLocal = 0;
+  uint64_t HistoricalKept = 0;
+  uint64_t ProfileChanged = 0;
+  uint64_t ProfileCommuteTried = 0;
+  uint64_t ProfileCommuteAccepted = 0;
+  uint64_t ProductBankBoundary = 0;
+  uint64_t IntMildOverflow = 0;
+  uint64_t IntSevereOverflow = 0;
+  uint64_t FPOverflow = 0;
+  uint64_t BoundaryProductBank = 0;
+  uint64_t M3FPBank = 0;
+  uint64_t M3Distance = 0;
+  uint64_t UWVM2StrictFPAccum = 0;
+  uint64_t EstimatedLocalGet = 0;
+  uint64_t EstimatedLocalSet = 0;
+  uint64_t EstimatedTee = 0;
+  uint64_t KeepLocalBoundary = 0;
+  uint64_t DelayLocalRHSCommuteTried = 0;
+  uint64_t DelayLocalRHSCommuteAccepted = 0;
+};
+
 static StringRef actionName(StackifyActionKind Kind) {
   switch (Kind) {
   case StackifyActionKind::KeepLocal:
@@ -1037,6 +1134,94 @@ static StringRef actionName(StackifyActionKind Kind) {
     return "tee";
   }
   llvm_unreachable("unknown stackify action");
+}
+
+static void countSelectedAction(WasmTuneShapeStats &Stats,
+                                StackifyActionKind Kind) {
+  switch (Kind) {
+  case StackifyActionKind::Move:
+    ++Stats.Move;
+    break;
+  case StackifyActionKind::Rematerialize:
+    ++Stats.Rematerialize;
+    break;
+  case StackifyActionKind::Tee:
+    ++Stats.Tee;
+    break;
+  case StackifyActionKind::KeepLocal:
+    ++Stats.KeepLocal;
+    break;
+  }
+}
+
+static void countProfileVeto(const WasmExecutionProfile &Profile,
+                             const ProfileGateResult &Gate,
+                             WasmTuneShapeStats &Stats) {
+  if (!Gate.ProfileVeto)
+    return;
+
+  switch (Gate.Reason) {
+  case ProfileGateResult::RingOverflow:
+  case ProfileGateResult::ScoreDelta:
+    if (Profile.IntRingCapacity && Gate.AfterPeakInt > Profile.IntRingCapacity) {
+      if (Gate.AfterPeakInt == Profile.IntRingCapacity + 1)
+        ++Stats.IntMildOverflow;
+      else
+        ++Stats.IntSevereOverflow;
+    }
+    if (Profile.FPRingCapacity && Gate.AfterPeakFP > Profile.FPRingCapacity)
+      ++Stats.FPOverflow;
+    break;
+  case ProfileGateResult::M3FPDistance:
+  case ProfileGateResult::M3TeeDistance:
+    ++Stats.M3Distance;
+    break;
+  case ProfileGateResult::M3FPBank:
+    ++Stats.M3FPBank;
+    break;
+  case ProfileGateResult::UWVM2StrictFPAccum:
+    ++Stats.UWVM2StrictFPAccum;
+    break;
+  case ProfileGateResult::None:
+    break;
+  }
+}
+
+static void dumpTuneShapeStats(MachineFunction &MF,
+                               const WebAssemblySubtarget &ST,
+                               const WasmTuneShapeStats &Stats) {
+  if (!WasmTuneShapeDump)
+    return;
+
+  dbgs() << "wasm-tune-shape:"
+         << " function=" << MF.getName();
+  if (ST.getTuneCPUName().empty())
+    dbgs() << " tune=default";
+  else
+    dbgs() << " tune=" << ST.getTuneCPUName();
+  dbgs() << " move=" << Stats.Move
+         << " remat=" << Stats.Rematerialize << " tee=" << Stats.Tee
+         << " keep-local=" << Stats.KeepLocal
+         << " historical-kept=" << Stats.HistoricalKept
+         << " profile-changed=" << Stats.ProfileChanged
+         << " profile-commute-tried=" << Stats.ProfileCommuteTried
+         << " profile-commute-accepted=" << Stats.ProfileCommuteAccepted
+         << " product-bank-boundary=" << Stats.ProductBankBoundary
+         << " int-mild-overflow=" << Stats.IntMildOverflow
+         << " int-severe-overflow=" << Stats.IntSevereOverflow
+         << " fp-overflow=" << Stats.FPOverflow
+         << " product-bank=" << Stats.BoundaryProductBank
+         << " m3-fp-bank=" << Stats.M3FPBank
+         << " m3-distance=" << Stats.M3Distance
+         << " uwvm2-strict-fp-accum=" << Stats.UWVM2StrictFPAccum
+         << " est-local-get=" << Stats.EstimatedLocalGet
+         << " est-local-set=" << Stats.EstimatedLocalSet
+         << " est-tee=" << Stats.EstimatedTee
+         << " keep-local-boundary=" << Stats.KeepLocalBoundary
+         << " delay-local-rhs-commute-tried="
+         << Stats.DelayLocalRHSCommuteTried
+         << " delay-local-rhs-commute-accepted="
+         << Stats.DelayLocalRHSCommuteAccepted << "\n";
 }
 
 static unsigned actionPriority(StackifyActionKind Kind) {
@@ -1106,6 +1291,45 @@ static bool isReassocFPProductBankNode(const MachineInstr *MI,
                                        const MachineRegisterInfo &MRI) {
   SmallPtrSet<const MachineInstr *, 16> Visiting;
   return isReassocFPProductBankNodeImpl(MI, MRI, /*Limit=*/16, Visiting);
+}
+
+static bool expressionTreeHasMemoryOrCallImpl(
+    const MachineInstr *MI, const MachineRegisterInfo &MRI, unsigned Limit,
+    SmallPtrSetImpl<const MachineInstr *> &Visiting) {
+  if (!MI || Limit == 0)
+    return false;
+  if (MI->mayLoad() || MI->mayStore() || MI->isCall() || MI->isInlineAsm())
+    return true;
+  if (!Visiting.insert(MI).second)
+    return false;
+
+  for (const MachineOperand &MO : MI->explicit_uses()) {
+    if (!MO.isReg() || !MO.getReg().isVirtual())
+      continue;
+    Register Reg = MO.getReg();
+    if (expressionTreeHasMemoryOrCallImpl(MRI.getUniqueVRegDef(Reg), MRI,
+                                          Limit - 1, Visiting)) {
+      Visiting.erase(MI);
+      return true;
+    }
+  }
+
+  Visiting.erase(MI);
+  return false;
+}
+
+static bool expressionTreeHasMemoryOrCall(
+    const MachineInstr *Root, Register CandidateReg,
+    const MachineInstr *CandidateDef, const MachineRegisterInfo &MRI) {
+  SmallPtrSet<const MachineInstr *, 16> Visiting;
+  if (expressionTreeHasMemoryOrCallImpl(Root, MRI, WasmTuneStackifyNodeLimit,
+                                        Visiting))
+    return true;
+  if (!CandidateReg.isValid() || !CandidateDef)
+    return false;
+  Visiting.clear();
+  return expressionTreeHasMemoryOrCallImpl(CandidateDef, MRI,
+                                           WasmTuneStackifyNodeLimit, Visiting);
 }
 
 static unsigned countReassocFPProductBankProductsImpl(
@@ -1184,6 +1408,24 @@ productBankBoundaryPenalty(const WasmExecutionProfile &Profile, Register Reg,
                                 Profile.LocalGetCost + Profile.LocalSetCost);
 }
 
+static bool shouldPreferUWVM2StrictFPAccumBoundary(
+    const WasmExecutionProfile &Profile, Register Reg, MachineInstr *DefI,
+    MachineInstr *Insert, const MachineRegisterInfo &MRI,
+    const WasmExecPressureResult &StackifiedPressure) {
+  if (!Profile.HasUWVM2RegisterRingModel || !Profile.StrictFPAccumBoundary)
+    return false;
+  if (!DefI || !Insert || !isWasmFPReg(Reg, MRI))
+    return false;
+  if (!isFPAddOpcode(Insert->getOpcode()) ||
+      Insert->getFlag(MachineInstr::FmReassoc))
+    return false;
+  if (!(isFPAddOpcode(DefI->getOpcode()) || isFPMulOpcode(DefI->getOpcode())))
+    return false;
+  if (DefI->getFlag(MachineInstr::FmReassoc))
+    return false;
+  return StackifiedPressure.PeakFP > Profile.StrictFPAccumBoundary;
+}
+
 static ProfileGateResult profileGateU2Delta(const WebAssemblySubtarget &ST,
                                             Register Reg, MachineInstr *DefI,
                                             MachineInstr *Insert,
@@ -1193,23 +1435,31 @@ static ProfileGateResult profileGateU2Delta(const WebAssemblySubtarget &ST,
   const WasmExecutionProfile &Profile = ST.getExecutionProfile();
   WasmExecPressureResult Before = estimateStackifiedTreePressure(
       *Insert, MRI, MFI, WasmTuneStackifyNodeLimit);
-  finishPressureForProfile(Profile, Before);
+  finishPressureForTuning(Profile, Before);
 
   WasmExecPressureResult After = estimateStackifiedTreePressure(
       *Insert, Reg, *DefI, MRI, MFI, WasmTuneStackifyNodeLimit);
-  finishPressureForProfile(Profile, After);
+  finishPressureForTuning(Profile, After);
 
-  unsigned BeforeOverflow = totalOverflow(Profile, Before);
-  unsigned AfterOverflow = totalOverflow(Profile, After);
+  unsigned BeforeOverflow = totalTuningOverflow(Profile, Before);
+  unsigned AfterOverflow = totalTuningOverflow(Profile, After);
   bool Allow = true;
   StringRef Reason;
+  ProfileGateResult::VetoReason VetoReason = ProfileGateResult::None;
   if (AfterOverflow > BeforeOverflow) {
     Allow = false;
     Reason = "ring-overflow";
+    VetoReason = ProfileGateResult::RingOverflow;
+  } else if (shouldPreferUWVM2StrictFPAccumBoundary(Profile, Reg, DefI, Insert,
+                                                   MRI, After)) {
+    Allow = false;
+    Reason = "uwvm2-strict-fp-accum";
+    VetoReason = ProfileGateResult::UWVM2StrictFPAccum;
   } else if (!(After.HitLimit && !Before.HitLimit) && AfterOverflow != 0 &&
              After.Score > Before.Score + WasmTuneStackifyScoreHysteresis) {
     Allow = false;
     Reason = "score-delta";
+    VetoReason = ProfileGateResult::ScoreDelta;
   }
 
   LLVM_DEBUG({
@@ -1232,7 +1482,13 @@ static ProfileGateResult profileGateU2Delta(const WebAssemblySubtarget &ST,
     }
   });
 
-  return {Allow, !Allow};
+  ProfileGateResult Result;
+  Result.Allow = Allow;
+  Result.ProfileVeto = !Allow;
+  Result.Reason = VetoReason;
+  Result.AfterPeakFP = After.PeakFP;
+  Result.AfterPeakInt = After.PeakInt;
+  return Result;
 }
 
 static ProfileGateResult profileGateMove(const WebAssemblySubtarget &ST,
@@ -1253,17 +1509,20 @@ static ProfileGateResult profileGateMove(const WebAssemblySubtarget &ST,
 
   WasmExecPressureResult R = estimateStackifiedTreePressure(
       *Insert, Reg, *DefI, MRI, MFI, WasmTuneStackifyNodeLimit);
-  finishPressureForProfile(Profile, R);
+  finishPressureForTuning(Profile, R);
 
   bool Allow = true;
   StringRef Reason;
+  ProfileGateResult::VetoReason VetoReason = ProfileGateResult::None;
   unsigned Dist = nonDebugDistance(DefI, Insert, /*Limit=*/16);
   if (VC == WasmValueClass::FP && Dist > 4) {
     Allow = false;
     Reason = "m3-fp-distance";
+    VetoReason = ProfileGateResult::M3FPDistance;
   } else if (VC == WasmValueClass::FP && R.PeakFP > 2) {
     Allow = false;
     Reason = "m3-fp-bank";
+    VetoReason = ProfileGateResult::M3FPBank;
   }
 
   LLVM_DEBUG({
@@ -1279,7 +1538,13 @@ static ProfileGateResult profileGateMove(const WebAssemblySubtarget &ST,
     }
   });
 
-  return {Allow, !Allow};
+  ProfileGateResult Result;
+  Result.Allow = Allow;
+  Result.ProfileVeto = !Allow;
+  Result.Reason = VetoReason;
+  Result.AfterPeakFP = R.PeakFP;
+  Result.AfterPeakInt = R.PeakInt;
+  return Result;
 }
 
 static ProfileGateResult
@@ -1321,16 +1586,19 @@ static ProfileGateResult profileGateTee(const WebAssemblySubtarget &ST,
   unsigned Dist = nonDebugDistance(DefI, Insert, /*Limit=*/8);
   WasmExecPressureResult R = estimateStackifiedTreePressure(
       *Insert, Reg, *DefI, MRI, MFI, WasmTuneStackifyNodeLimit);
-  finishPressureForProfile(Profile, R);
+  finishPressureForTuning(Profile, R);
 
   bool Allow = true;
   StringRef Reason;
+  ProfileGateResult::VetoReason VetoReason = ProfileGateResult::None;
   if (VC == WasmValueClass::FP && Dist > 3) {
     Allow = false;
     Reason = "m3-tee-distance";
+    VetoReason = ProfileGateResult::M3TeeDistance;
   } else if (VC == WasmValueClass::FP && R.PeakFP > 2) {
     Allow = false;
     Reason = "m3-fp-bank";
+    VetoReason = ProfileGateResult::M3FPBank;
   }
 
   LLVM_DEBUG({
@@ -1345,7 +1613,13 @@ static ProfileGateResult profileGateTee(const WebAssemblySubtarget &ST,
     }
   });
 
-  return {Allow, !Allow};
+  ProfileGateResult Result;
+  Result.Allow = Allow;
+  Result.ProfileVeto = !Allow;
+  Result.Reason = VetoReason;
+  Result.AfterPeakFP = R.PeakFP;
+  Result.AfterPeakInt = R.PeakInt;
+  return Result;
 }
 
 static WasmExecPressureResult estimatePressureForProfileCandidate(
@@ -1358,7 +1632,7 @@ static WasmExecPressureResult estimatePressureForProfileCandidate(
                                            MRI, MFI, WasmTuneStackifyNodeLimit)
           : estimateStackifiedTreePressure(*Insert, MRI, MFI,
                                            WasmTuneStackifyNodeLimit);
-  finishPressureForProfile(Profile, R);
+  finishPressureForTuning(Profile, R);
   return R;
 }
 
@@ -1432,7 +1706,8 @@ chooseProfileActionCandidate(const WebAssemblySubtarget &ST, Register Reg,
                              const WebAssemblyFunctionInfo &MFI, bool MoveLegal,
                              const ProfileGateResult &MoveGate, bool RematLegal,
                              const ProfileGateResult &RematGate, bool TeeLegal,
-                             const ProfileGateResult &TeeGate) {
+                             const ProfileGateResult &TeeGate,
+                             WasmTuneShapeStats *ShapeStats = nullptr) {
   const WasmExecutionProfile &Profile = ST.getExecutionProfile();
   StackifyActionCandidate Keep =
       scoreStackifyAction(StackifyActionKind::KeepLocal, /*Legal=*/true, Reg,
@@ -1456,10 +1731,16 @@ chooseProfileActionCandidate(const WebAssemblySubtarget &ST, Register Reg,
     Historical = Tee;
 
   StackifyActionCandidate Best = Historical;
-  if (shouldPreferProductBankBoundary(Profile, Reg, DefI, Insert, MRI,
-                                      Historical.Pressure) &&
-      isBetterAction(Keep, Best))
-    Best = Keep;
+  bool ProductBankBoundary = shouldPreferProductBankBoundary(
+      Profile, Reg, DefI, Insert, MRI, Historical.Pressure);
+  if (ProductBankBoundary) {
+    if (ShapeStats) {
+      ++ShapeStats->ProductBankBoundary;
+      ++ShapeStats->BoundaryProductBank;
+    }
+    if (isBetterAction(Keep, Best))
+      Best = Keep;
+  }
   if (isBetterAction(Move, Best))
     Best = Move;
   if (isBetterAction(Remat, Best))
@@ -1476,6 +1757,16 @@ chooseProfileActionCandidate(const WebAssemblySubtarget &ST, Register Reg,
   if (Best.Kind != Historical.Kind &&
       Best.Score + WasmTuneStackifyScoreHysteresis < Historical.Score)
     Chosen = Best;
+
+  if (ShapeStats) {
+    if (Chosen.Kind == Historical.Kind)
+      ++ShapeStats->HistoricalKept;
+    else
+      ++ShapeStats->ProfileChanged;
+    ShapeStats->EstimatedLocalGet += Chosen.Pressure.EstimatedLocalGets;
+    ShapeStats->EstimatedLocalSet += Chosen.Pressure.EstimatedLocalSets;
+    ShapeStats->EstimatedTee += Chosen.Pressure.EstimatedTees;
+  }
 
   LLVM_DEBUG({
     if (Chosen.Kind != Historical.Kind) {
@@ -1515,11 +1806,12 @@ static bool isProfileCommuteBetter(const WasmExecutionProfile &Profile,
   return After.Score + WasmTuneStackifyScoreHysteresis < Before.Score;
 }
 
-static bool maybeProfileCommuteAfterVeto(
+static bool maybeProfileCommuteForCandidate(
     MachineInstr *Insert, TreeWalkerState &TreeWalker,
     const WebAssemblySubtarget &ST, const MachineRegisterInfo &MRI,
     const WebAssemblyFunctionInfo &MFI, const WebAssemblyInstrInfo *TII,
-    Register CandidateReg, MachineInstr *CandidateDef) {
+    Register CandidateReg, MachineInstr *CandidateDef,
+    WasmTuneShapeStats *ShapeStats = nullptr) {
   const WasmExecutionProfile &Profile = ST.getExecutionProfile();
   if (!shouldUseProfileGate(Profile, Insert))
     return false;
@@ -1530,6 +1822,8 @@ static bool maybeProfileCommuteAfterVeto(
   unsigned Operand1 = TargetInstrInfo::CommuteAnyOperandIndex;
   if (!TII->findCommutedOpIndices(*Insert, Operand0, Operand1))
     return false;
+  if (ShapeStats)
+    ++ShapeStats->ProfileCommuteTried;
 
   WasmExecPressureResult Before = estimatePressureForProfileCandidate(
       Insert, CandidateReg, CandidateDef, MRI, MFI, Profile);
@@ -1544,6 +1838,8 @@ static bool maybeProfileCommuteAfterVeto(
 
   if (isProfileCommuteBetter(Profile, Before, After)) {
     TreeWalker.restartOperands(Insert);
+    if (ShapeStats)
+      ++ShapeStats->ProfileCommuteAccepted;
     LLVM_DEBUG(dbgs() << "wasm-tune-stackify: profile-commute"
                       << " tune=" << ST.getTuneCPUName() << " before-peak-fp="
                       << Before.PeakFP << " before-peak-int=" << Before.PeakInt
@@ -1565,6 +1861,81 @@ static bool maybeProfileCommuteAfterVeto(
   return false;
 }
 
+static bool isUWVM2DelayLocalLeaf(const MachineOperand &MO,
+                                  const MachineRegisterInfo &MRI,
+                                  const WebAssemblyFunctionInfo &MFI,
+                                  const WebAssemblyInstrInfo *TII) {
+  if (!MO.isReg() || !MO.isUse() || MO.isUndef())
+    return false;
+  Register Reg = MO.getReg();
+  if (!Reg.isVirtual() || MFI.isVRegStackified(Reg))
+    return false;
+  if (!isWasmIntReg(Reg, MRI))
+    return false;
+
+  MachineInstr *DefI = MRI.getUniqueVRegDef(Reg);
+  if (!DefI)
+    return true;
+  // Constants are better handled by rematerialization/const-specific fusion.
+  if (shouldRematerialize(*DefI, TII))
+    return false;
+  if (WebAssembly::isArgument(DefI->getOpcode()))
+    return true;
+  return !MRI.hasOneNonDBGUse(Reg);
+}
+
+static bool maybeCommuteUWVM2DelayLocalRHS(
+    MachineInstr *Insert, MachineOperand &CandidateUse,
+    TreeWalkerState &TreeWalker, const WebAssemblySubtarget &ST,
+    const MachineRegisterInfo &MRI, const WebAssemblyFunctionInfo &MFI,
+    const WebAssemblyInstrInfo *TII, Register CandidateReg,
+    MachineInstr *CandidateDef, WasmTuneShapeStats *ShapeStats = nullptr) {
+  const WasmExecutionProfile &Profile = ST.getExecutionProfile();
+  if (!Profile.HasUWVM2RegisterRingModel || !shouldUseProfileGate(Profile, Insert))
+    return false;
+  if (Insert->isInlineAsm() || Insert->mayLoad() || Insert->mayStore() ||
+      Insert->isCall())
+    return false;
+  if (CandidateUse.getParent() != Insert)
+    return false;
+  if (!CandidateReg.isVirtual() || !isWasmIntReg(CandidateReg, MRI))
+    return false;
+  if (!CandidateDef || shouldRematerialize(*CandidateDef, TII))
+    return false;
+  if (isUWVM2DelayLocalLeaf(CandidateUse, MRI, MFI, TII))
+    return false;
+  if (expressionTreeHasMemoryOrCall(Insert, CandidateReg, CandidateDef, MRI))
+    return false;
+
+  unsigned Operand0 = TargetInstrInfo::CommuteAnyOperandIndex;
+  unsigned Operand1 = TargetInstrInfo::CommuteAnyOperandIndex;
+  if (!TII->findCommutedOpIndices(*Insert, Operand0, Operand1))
+    return false;
+  if (&CandidateUse != &Insert->getOperand(Operand1))
+    return false;
+  if (ShapeStats)
+    ++ShapeStats->DelayLocalRHSCommuteTried;
+
+  MachineOperand &LHS = Insert->getOperand(Operand0);
+  if (!isUWVM2DelayLocalLeaf(LHS, MRI, MFI, TII))
+    return false;
+
+  MachineInstr *Commuted =
+      TII->commuteInstruction(*Insert, /*NewMI=*/false, Operand0, Operand1);
+  if (!Commuted)
+    return false;
+  TreeWalker.restartOperands(Insert);
+  if (ShapeStats)
+    ++ShapeStats->DelayLocalRHSCommuteAccepted;
+
+  LLVM_DEBUG({
+    dbgs() << "wasm-tune-stackify: delay-local-rhs-commute"
+           << " tune=" << ST.getTuneCPUName() << " instr=";
+    Insert->print(dbgs());
+  });
+  return true;
+}
+
 bool WebAssemblyRegStackify::runOnMachineFunction(MachineFunction &MF) {
   LLVM_DEBUG(dbgs() << "********** Register Stackifying **********\n"
                        "********** Function: "
@@ -1575,6 +1946,7 @@ bool WebAssemblyRegStackify::runOnMachineFunction(MachineFunction &MF) {
   WebAssemblyFunctionInfo &MFI = *MF.getInfo<WebAssemblyFunctionInfo>();
   const auto &WasmST = MF.getSubtarget<WebAssemblySubtarget>();
   const auto *TII = WasmST.getInstrInfo();
+  WasmTuneShapeStats ShapeStats;
   MachineDominatorTree *MDT = nullptr;
   LiveIntervals *LIS = nullptr;
   if (Optimize) {
@@ -1607,6 +1979,7 @@ bool WebAssemblyRegStackify::runOnMachineFunction(MachineFunction &MF) {
       // operands off the stack in LIFO order.
       CommutingState Commuting;
       SmallPtrSet<MachineInstr *, 4> ProfileCommuteTried;
+      SmallPtrSet<MachineInstr *, 4> DelayLocalRHSCommuteTried;
       TreeWalkerState TreeWalker(Insert);
       while (!TreeWalker.done()) {
         MachineOperand &Use = TreeWalker.pop();
@@ -1665,6 +2038,7 @@ bool WebAssemblyRegStackify::runOnMachineFunction(MachineFunction &MF) {
         auto RecordProfileVeto = [&](const ProfileGateResult &Gate) {
           if (!Gate.ProfileVeto)
             return;
+          countProfileVeto(WasmST.getExecutionProfile(), Gate, ShapeStats);
           ProfileVetoed = true;
           if (!ProfileVetoDef) {
             ProfileVetoReg = Reg;
@@ -1693,12 +2067,38 @@ bool WebAssemblyRegStackify::runOnMachineFunction(MachineFunction &MF) {
                                   (RematLegal && RematGate.Allow) ||
                                   (TeeLegal && TeeGate.Allow);
 
+        if (SameBlock && MoveLegal && MoveGate.Allow &&
+            WasmST.getExecutionProfile().HasUWVM2RegisterRingModel &&
+            !DelayLocalRHSCommuteTried.contains(Insert) &&
+            maybeCommuteUWVM2DelayLocalRHS(Insert, Use, TreeWalker, WasmST, MRI,
+                                           MFI, TII, Reg, DefI,
+                                           &ShapeStats)) {
+          DelayLocalRHSCommuteTried.insert(Insert);
+          Commuting.reset();
+          Changed = true;
+          continue;
+        }
+
+        if (SameBlock && MoveLegal && MoveGate.Allow &&
+            WasmST.getExecutionProfile().HasUWVM2RegisterRingModel &&
+            !expressionTreeHasMemoryOrCall(Insert, Reg, DefI, MRI) &&
+            !ProfileCommuteTried.contains(Insert) &&
+            maybeProfileCommuteForCandidate(Insert, TreeWalker, WasmST, MRI,
+                                            MFI, TII, Reg, DefI,
+                                            &ShapeStats)) {
+          ProfileCommuteTried.insert(Insert);
+          Commuting.reset();
+          Changed = true;
+          continue;
+        }
+
         StackifyActionKind SelectedAction = StackifyActionKind::KeepLocal;
         if (shouldUseProfileGate(WasmST.getExecutionProfile(), Insert)) {
           SelectedAction =
               chooseProfileActionCandidate(WasmST, Reg, DefI, Insert, MRI, MFI,
                                            MoveLegal, MoveGate, RematLegal,
-                                           RematGate, TeeLegal, TeeGate)
+                                           RematGate, TeeLegal, TeeGate,
+                                           &ShapeStats)
                   .Kind;
         } else if (MoveLegal && MoveGate.Allow) {
           SelectedAction = StackifyActionKind::Move;
@@ -1707,6 +2107,10 @@ bool WebAssemblyRegStackify::runOnMachineFunction(MachineFunction &MF) {
         } else if (TeeLegal && TeeGate.Allow) {
           SelectedAction = StackifyActionKind::Tee;
         }
+        countSelectedAction(ShapeStats, SelectedAction);
+        if (SelectedAction == StackifyActionKind::KeepLocal &&
+            (MoveLegal || RematLegal || TeeLegal))
+          ++ShapeStats.KeepLocalBoundary;
 
         switch (SelectedAction) {
         case StackifyActionKind::Move:
@@ -1748,9 +2152,9 @@ bool WebAssemblyRegStackify::runOnMachineFunction(MachineFunction &MF) {
           // constraints, Commuting may be able to help.
           if (SameBlock && ProfileVetoed && !HasAllowedStackify &&
               !ProfileCommuteTried.contains(Insert) &&
-              maybeProfileCommuteAfterVeto(Insert, TreeWalker, WasmST, MRI, MFI,
-                                           TII, ProfileVetoReg,
-                                           ProfileVetoDef)) {
+              maybeProfileCommuteForCandidate(Insert, TreeWalker, WasmST, MRI,
+                                              MFI, TII, ProfileVetoReg,
+                                              ProfileVetoDef, &ShapeStats)) {
             ProfileCommuteTried.insert(Insert);
             Commuting.reset();
             Changed = true;
@@ -1816,6 +2220,7 @@ bool WebAssemblyRegStackify::runOnMachineFunction(MachineFunction &MF) {
 
   if (WasmExecPressureDump)
     dumpExecutionPressure(MF, WasmST, MFI, MRI);
+  dumpTuneShapeStats(MF, WasmST, ShapeStats);
 
 #ifndef NDEBUG
   // Verify that pushes and pops are performed in LIFO order.

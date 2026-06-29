@@ -135,6 +135,12 @@ def : ProcessorModel<"mvp", NoSchedModel, []>;
 def : ProcessorModel<"u2-aapcs64", NoSchedModel, []>;
 def : ProcessorModel<"u2-sysv", NoSchedModel, []>;
 def : ProcessorModel<"u2-x86_64-sysv", NoSchedModel, []>;
+def : ProcessorModel<"uwvm2", NoSchedModel, []>;
+def : ProcessorModel<"uwvm2-int", NoSchedModel, []>;
+def : ProcessorModel<"uwvm2-aapcs64", NoSchedModel, []>;
+def : ProcessorModel<"uwvm2-aarch64-aapcs64", NoSchedModel, []>;
+def : ProcessorModel<"uwvm2-sysv", NoSchedModel, []>;
+def : ProcessorModel<"uwvm2-x86_64-sysv", NoSchedModel, []>;
 def : ProcessorModel<"m3", NoSchedModel, []>;
 
 // Generic processor: latest stable version.

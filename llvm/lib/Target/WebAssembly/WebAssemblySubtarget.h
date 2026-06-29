@@ -49,8 +49,13 @@ struct WasmExecutionProfile {
 
   unsigned FPRingCapacity = 0;
   unsigned IntRingCapacity = 0;
+  // Physical register-ring capacity is used for dumps and diagnostics.
+  // Tuning boundaries are allowed to be softer when a real engine can absorb
+  // mild transient pressure more cheaply than extra local traffic.
+  unsigned IntTuningBoundary = 0;
 
   bool HasRegisterRing = false;
+  bool HasUWVM2RegisterRingModel = false;
   bool HasM3SlotProviderModel = false;
 
   unsigned DispatchCost = 1;
@@ -64,6 +69,7 @@ struct WasmExecutionProfile {
 
   unsigned PreferredFPBank = 1;
   unsigned PreferredIntBank = 1;
+  unsigned StrictFPAccumBoundary = 0;
 };
 
 class WebAssemblySubtarget final : public WebAssemblyGenSubtargetInfo {

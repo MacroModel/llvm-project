@@ -38,12 +38,36 @@ static constexpr auto BuiltinInfos = Builtin::MakeInfos<NumBuiltins>({
 });
 
 static constexpr llvm::StringLiteral ValidCPUNames[] = {
-    {"mvp"},        {"bleeding-edge"}, {"generic"},        {"lime1"},
-    {"u2-aapcs64"}, {"u2-sysv"},       {"u2-x86_64-sysv"}, {"m3"}};
+    {"mvp"},
+    {"bleeding-edge"},
+    {"generic"},
+    {"lime1"},
+    {"u2-aapcs64"},
+    {"u2-sysv"},
+    {"u2-x86_64-sysv"},
+    {"uwvm2"},
+    {"uwvm2-int"},
+    {"uwvm2-aapcs64"},
+    {"uwvm2-aarch64-aapcs64"},
+    {"uwvm2-sysv"},
+    {"uwvm2-x86_64-sysv"},
+    {"m3"}};
 
 static constexpr llvm::StringLiteral ValidTuneCPUNames[] = {
-    {"mvp"},        {"bleeding-edge"}, {"generic"},        {"lime1"},
-    {"u2-aapcs64"}, {"u2-sysv"},       {"u2-x86_64-sysv"}, {"m3"}};
+    {"mvp"},
+    {"bleeding-edge"},
+    {"generic"},
+    {"lime1"},
+    {"u2-aapcs64"},
+    {"u2-sysv"},
+    {"u2-x86_64-sysv"},
+    {"uwvm2"},
+    {"uwvm2-int"},
+    {"uwvm2-aapcs64"},
+    {"uwvm2-aarch64-aapcs64"},
+    {"uwvm2-sysv"},
+    {"uwvm2-x86_64-sysv"},
+    {"m3"}};
 
 StringRef WebAssemblyTargetInfo::getABI() const { return ABI; }
 
