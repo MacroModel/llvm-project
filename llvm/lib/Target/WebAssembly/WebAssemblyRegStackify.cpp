@@ -916,6 +916,22 @@ static unsigned fpOverflow(const WasmExecutionProfile &Profile,
                                            : 0;
 }
 
+static unsigned tuningFPBoundaryCap(const WasmExecutionProfile &Profile) {
+  if (!Profile.FPRingCapacity)
+    return 0;
+  if (Profile.FPTuningBoundary)
+    return Profile.FPTuningBoundary;
+  return Profile.FPRingCapacity;
+}
+
+static unsigned tuningFPOverflow(const WasmExecutionProfile &Profile,
+                                 const WasmExecPressureResult &R) {
+  unsigned Cap = tuningFPBoundaryCap(Profile);
+  if (!Cap)
+    return 0;
+  return R.PeakFP > Cap ? R.PeakFP - Cap : 0;
+}
+
 static unsigned intOverflow(const WasmExecutionProfile &Profile,
                             const WasmExecPressureResult &R) {
   if (!Profile.IntRingCapacity)
@@ -951,7 +967,8 @@ static int64_t scorePressureForTuning(const WasmExecutionProfile &Profile,
   Score += int64_t(Profile.TeeCost) * R.EstimatedTees;
 
   if (Profile.HasRegisterRing) {
-    unsigned Overflow = fpOverflow(Profile, R) + tuningIntOverflow(Profile, R);
+    unsigned Overflow =
+        tuningFPOverflow(Profile, R) + tuningIntOverflow(Profile, R);
     Score += int64_t(Profile.SpillCost + Profile.FillCost) * Overflow;
   }
 
@@ -978,7 +995,8 @@ static void finishPressureForProfile(const WasmExecutionProfile &Profile,
 
 static void finishPressureForTuning(const WasmExecutionProfile &Profile,
                                     WasmExecPressureResult &R) {
-  unsigned Overflow = fpOverflow(Profile, R) + tuningIntOverflow(Profile, R);
+  unsigned Overflow =
+      tuningFPOverflow(Profile, R) + tuningIntOverflow(Profile, R);
   if (Profile.HasRegisterRing) {
     R.EstimatedRingSpills = Overflow;
     R.EstimatedRingFills = Overflow;
@@ -996,7 +1014,7 @@ static unsigned totalOverflow(const WasmExecutionProfile &Profile,
 
 static unsigned totalTuningOverflow(const WasmExecutionProfile &Profile,
                                     const WasmExecPressureResult &R) {
-  return fpOverflow(Profile, R) + tuningIntOverflow(Profile, R);
+  return tuningFPOverflow(Profile, R) + tuningIntOverflow(Profile, R);
 }
 
 static void dumpExecutionPressure(MachineFunction &MF,
@@ -1430,6 +1448,58 @@ productBankBoundaryPenalty(const WasmExecutionProfile &Profile, Register Reg,
                                 Profile.LocalGetCost + Profile.LocalSetCost);
 }
 
+static bool strictFPTreeHasMultiUseFPInputImpl(
+    const MachineInstr *MI, const MachineRegisterInfo &MRI, unsigned Limit,
+    SmallPtrSetImpl<const MachineInstr *> &Visiting) {
+  if (!MI || Limit == 0)
+    return false;
+  if (!(isFPAddOpcode(MI->getOpcode()) || isFPMulOpcode(MI->getOpcode())) ||
+      MI->getFlag(MachineInstr::FmReassoc))
+    return false;
+  if (!Visiting.insert(MI).second)
+    return false;
+
+  for (const MachineOperand &MO : MI->explicit_uses()) {
+    if (!MO.isReg() || !MO.getReg().isVirtual())
+      continue;
+    Register Reg = MO.getReg();
+    if (isWasmFPReg(Reg, MRI) && !MRI.hasOneNonDBGUse(Reg)) {
+      Visiting.erase(MI);
+      return true;
+    }
+    if (strictFPTreeHasMultiUseFPInputImpl(MRI.getUniqueVRegDef(Reg), MRI,
+                                           Limit - 1, Visiting)) {
+      Visiting.erase(MI);
+      return true;
+    }
+  }
+
+  Visiting.erase(MI);
+  return false;
+}
+
+static bool strictFPTreeHasMultiUseFPInput(const MachineInstr *MI,
+                                           const MachineRegisterInfo &MRI) {
+  SmallPtrSet<const MachineInstr *, 16> Visiting;
+  return strictFPTreeHasMultiUseFPInputImpl(MI, MRI, /*Limit=*/16, Visiting);
+}
+
+static bool strictFPAccumEdgeHasReusableInput(
+    const MachineInstr *DefI, const MachineInstr *Insert,
+    const MachineRegisterInfo &MRI) {
+  if (strictFPTreeHasMultiUseFPInput(DefI, MRI))
+    return true;
+  if (!Insert)
+    return false;
+  for (const MachineOperand &MO : Insert->explicit_uses()) {
+    if (!MO.isReg() || !MO.getReg().isVirtual())
+      continue;
+    if (strictFPTreeHasMultiUseFPInput(MRI.getUniqueVRegDef(MO.getReg()), MRI))
+      return true;
+  }
+  return false;
+}
+
 static bool shouldPreferUWVM2StrictFPAccumBoundary(
     const WasmExecutionProfile &Profile, Register Reg, MachineInstr *DefI,
     MachineInstr *Insert, const MachineRegisterInfo &MRI,
@@ -1444,6 +1514,8 @@ static bool shouldPreferUWVM2StrictFPAccumBoundary(
   if (!(isFPAddOpcode(DefI->getOpcode()) || isFPMulOpcode(DefI->getOpcode())))
     return false;
   if (DefI->getFlag(MachineInstr::FmReassoc))
+    return false;
+  if (strictFPAccumEdgeHasReusableInput(DefI, Insert, MRI))
     return false;
   return StackifiedPressure.PeakFP > Profile.StrictFPAccumBoundary;
 }

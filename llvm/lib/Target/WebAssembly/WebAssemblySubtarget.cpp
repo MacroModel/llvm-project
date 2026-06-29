@@ -54,8 +54,9 @@ static WasmExecutionProfile computeExecutionProfile(StringRef TuneCPU) {
     Profile.HasRegisterRing = true;
     Profile.HasUWVM2RegisterRingModel = true;
     Profile.FPRingCapacity = 8;
+    Profile.FPTuningBoundary = 12;
     Profile.IntRingCapacity = 3;
-    Profile.IntTuningBoundary = 5;
+    Profile.IntTuningBoundary = 7;
     Profile.StrictFPAccumBoundary = 2;
     Profile.PreferredFPBank = 8;
     Profile.PreferredIntBank = 5;
@@ -74,7 +75,8 @@ static WasmExecutionProfile computeExecutionProfile(StringRef TuneCPU) {
     // UWVM2's delay_local and register-ring translator can absorb a little
     // more transient integer stack pressure than the physical SysV ring before
     // extra local traffic becomes profitable.
-    Profile.IntTuningBoundary = 5;
+    Profile.FPTuningBoundary = 12;
+    Profile.IntTuningBoundary = 7;
     Profile.StrictFPAccumBoundary = 2;
     Profile.PreferredFPBank = 8;
     Profile.PreferredIntBank = 5;

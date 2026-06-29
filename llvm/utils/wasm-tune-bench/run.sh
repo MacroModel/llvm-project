@@ -16,6 +16,7 @@ ITER="${ITER:-200000}"
 REPEAT="${REPEAT:-3}"
 UWVM2_TUNE="${UWVM2_TUNE:-uwvm2}"
 WASM3_TUNE="${WASM3_TUNE:-m3}"
+BENCH_FILTER="${BENCH_FILTER:-}"
 
 mkdir -p "$OUT/wasm" "$OUT/log"
 CSV="$OUT/results.csv"
@@ -203,6 +204,9 @@ measure() {
 
 for def in "${bench_defs[@]}"; do
   read -r bench macro math <<< "$def"
+  if [[ -n "$BENCH_FILTER" && ! "$bench" =~ $BENCH_FILTER ]]; then
+    continue
+  fi
   for tune in "${tunes[@]}"; do
     wasm="$OUT/wasm/$bench.$tune.wasm"
     compile_wasm "$bench" "$macro" "$math" "$tune" "$wasm"

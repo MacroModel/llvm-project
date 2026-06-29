@@ -52,6 +52,7 @@ struct WasmExecutionProfile {
   // Physical register-ring capacity is used for dumps and diagnostics.
   // Tuning boundaries are allowed to be softer when a real engine can absorb
   // mild transient pressure more cheaply than extra local traffic.
+  unsigned FPTuningBoundary = 0;
   unsigned IntTuningBoundary = 0;
 
   bool HasRegisterRing = false;
