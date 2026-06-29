@@ -6,24 +6,40 @@ SRC="$ROOT/llvm/utils/wasm-tune-bench/microbench.c"
 
 LLVM_BUILD="${LLVM_BUILD:-$ROOT/build-wasm-tune}"
 CLANG="${CLANG:-$LLVM_BUILD/bin/clang}"
-WASM_LD="${WASM_LD:-/home/macromodel/Documents/tool-chain/x86_64-linux-gnu-llvm/bin/wasm-ld}"
-UWVM="${UWVM:-/home/macromodel/Documents/src/uwvm2/build/linux/x86_64/release/uwvm}"
-WASM3="${WASM3:-/home/macromodel/Documents/src/wasm3/build-clang-release/wasm3}"
+WASM_LD="${WASM_LD:-$LLVM_BUILD/bin/wasm-ld}"
+
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  UWVM="${UWVM:-/Users/liyinan/Documents/MacroModel/src/uwvm2/build/macosx/arm64/release/uwvm}"
+  WASM3="${WASM3:-/Users/liyinan/Documents/MacroModel/src/wasm3/build-clang-release/wasm3}"
+  SYSROOT="${SYSROOT:-/Users/liyinan/Documents/MacroModel/src/wasi-libc/build-mvp/sysroot}"
+  UWVM2_TUNE="${UWVM2_TUNE:-u2-aapcs64}"
+else
+  UWVM="${UWVM:-/home/macromodel/Documents/src/uwvm2/build/linux/x86_64/release/uwvm}"
+  WASM3="${WASM3:-/home/macromodel/Documents/src/wasm3/build-clang-release/wasm3}"
+  SYSROOT="${SYSROOT:-}"
+  UWVM2_TUNE="${UWVM2_TUNE:-uwvm2}"
+fi
+
+TARGET="${TARGET:-wasm32-wasip1}"
 UWVM_EXTRA_ARGS="${UWVM_EXTRA_ARGS:-}"
+UWVM_RUN_ARGS="${UWVM_RUN_ARGS:--Rcc int -Rcm full --}"
+UWVM_VALIDATION_ARGS="${UWVM_VALIDATION_ARGS:---mode validation}"
+CLANG_EXTRA_FLAGS="${CLANG_EXTRA_FLAGS:-}"
 
 OUT="${OUT:-/tmp/wasm-tune-bench}"
 ITER="${ITER:-200000}"
 REPEAT="${REPEAT:-3}"
-UWVM2_TUNE="${UWVM2_TUNE:-uwvm2}"
 WASM3_TUNE="${WASM3_TUNE:-m3}"
 BENCH_FILTER="${BENCH_FILTER:-}"
 
 mkdir -p "$OUT/wasm" "$OUT/log"
 CSV="$OUT/results.csv"
 SHAPE_CSV="$OUT/shape-summary.csv"
+PAIR_CSV="$OUT/pairs.csv"
 
 printf 'bench,tune,runtime,iter,repeat,min_s,avg_s,status\n' > "$CSV"
 printf 'bench,tune,function,move,remat,tee,keep_local,historical_kept,profile_changed,profile_commute_tried,profile_commute_accepted,product_bank_boundary,int_mild_overflow,int_severe_overflow,fp_overflow,product_bank,m3_fp_bank,m3_distance,uwvm2_strict_fp_accum,uwvm2_move_int_boundary,uwvm2_tee_int_boundary,est_local_get,est_local_set,est_tee,keep_local_boundary,delay_local_rhs_commute_tried,delay_local_rhs_commute_accepted,localget2_scale_commute_tried,localget2_scale_commute_accepted\n' > "$SHAPE_CSV"
+printf 'bench,tune,runtime,iter,repeat,run,default_s,tuned_s,ratio,status\n' > "$PAIR_CSV"
 
 bench_defs=(
   "dot6_fast BENCH_DOT6 fast"
@@ -70,6 +86,25 @@ bench_defs=(
 
 tunes=(default "$UWVM2_TUNE" "$WASM3_TUNE")
 read -r -a uwvm_extra_args <<< "$UWVM_EXTRA_ARGS"
+read -r -a uwvm_run_args <<< "$UWVM_RUN_ARGS"
+read -r -a uwvm_validation_args <<< "$UWVM_VALIDATION_ARGS"
+read -r -a clang_extra_flags <<< "$CLANG_EXTRA_FLAGS"
+
+target_flags=(
+  "--target=$TARGET"
+  -mcpu=mvp
+  -mno-bulk-memory
+  -mno-bulk-memory-opt
+  -mno-nontrapping-fptoint
+  -mno-sign-ext
+  -mno-mutable-globals
+  -mno-multivalue
+  -mno-reference-types
+  -mno-call-indirect-overlong
+)
+if [[ -n "$SYSROOT" ]]; then
+  target_flags+=("--sysroot=$SYSROOT")
+fi
 
 compile_wasm() {
   local bench="$1"
@@ -89,13 +124,13 @@ compile_wasm() {
   fi
 
   "$CLANG" \
-    --target=wasm32-unknown-unknown \
-    -mcpu=mvp \
+    "${target_flags[@]}" \
     "${tune_flags[@]}" \
     -O3 \
     -fno-builtin \
     -nostdlib \
     "${math_flags[@]}" \
+    "${clang_extra_flags[@]}" \
     "-D$macro" \
     "-DITER=$ITER" \
     -fuse-ld="$WASM_LD" \
@@ -125,13 +160,13 @@ dump_shape() {
   fi
 
   "$CLANG" \
-    --target=wasm32-unknown-unknown \
-    -mcpu=mvp \
+    "${target_flags[@]}" \
     "${tune_flags[@]}" \
     -O3 \
     -fno-builtin \
     -nostdlib \
     "${math_flags[@]}" \
+    "${clang_extra_flags[@]}" \
     "-D$macro" \
     "-DITER=$ITER" \
     -mllvm -debug-only=wasm-reg-stackify \
@@ -162,26 +197,35 @@ dump_shape() {
     }' "$log" >> "$SHAPE_CSV"
 }
 
-measure() {
+run_timed() {
+  local tfile="$1"
+  local lfile="$2"
+  shift 2
+
+  python3 - "$tfile" "$lfile" "$@" <<'PY'
+import pathlib
+import subprocess
+import sys
+import time
+
+tfile = pathlib.Path(sys.argv[1])
+lfile = pathlib.Path(sys.argv[2])
+cmd = sys.argv[3:]
+start = time.perf_counter()
+proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+elapsed = time.perf_counter() - start
+lfile.write_bytes(proc.stdout)
+tfile.write_text(f"{elapsed:.9f}\n")
+sys.exit(proc.returncode)
+PY
+}
+
+emit_measure_row() {
   local bench="$1"
   local tune="$2"
   local runtime="$3"
-  local wasm="$4"
+  local status="$4"
   shift 4
-
-  local times=()
-  local status="ok"
-  for ((run = 1; run <= REPEAT; ++run)); do
-    local tfile="$OUT/log/$bench.$tune.$runtime.$run.time"
-    local lfile="$OUT/log/$bench.$tune.$runtime.$run.log"
-    if /usr/bin/time -f '%e' -o "$tfile" "$@" "$wasm" >"$lfile" 2>&1; then
-      times+=("$(cat "$tfile")")
-    else
-      status="fail"
-      break
-    fi
-  done
-
   if [[ "$status" != "ok" ]]; then
     printf '%s,%s,%s,%s,%s,NA,NA,%s\n' "$bench" "$tune" "$runtime" "$ITER" "$REPEAT" "$status" >> "$CSV"
     return
@@ -199,7 +243,100 @@ measure() {
       }
       printf "%s,%s,%s,%s,%s,%.6f,%.6f,ok\n",
              bench, tune, runtime, iter, repeat, min, sum / (ARGC - 1);
-    }' "${times[@]}" >> "$CSV"
+    }' "$@" >> "$CSV"
+}
+
+emit_pair_rows() {
+  local bench="$1"
+  local tune="$2"
+  local runtime="$3"
+  local status="$4"
+  shift 4
+  local times=("$@")
+
+  if [[ "$status" != "ok" ]]; then
+    printf '%s,%s,%s,%s,%s,NA,NA,NA,NA,%s\n' \
+      "$bench" "$tune" "$runtime" "$ITER" "$REPEAT" "$status" >> "$PAIR_CSV"
+    return
+  fi
+
+  local n=$((${#times[@]} / 2))
+  for ((i = 0; i < n; ++i)); do
+    local default_s="${times[$((i * 2))]}"
+    local tuned_s="${times[$((i * 2 + 1))]}"
+    awk -v bench="$bench" -v tune="$tune" -v runtime="$runtime" \
+        -v iter="$ITER" -v repeat="$REPEAT" -v run="$((i + 1))" \
+        -v default_s="$default_s" -v tuned_s="$tuned_s" '
+      BEGIN {
+        ratio = tuned_s == 0 ? 0 : default_s / tuned_s;
+        printf "%s,%s,%s,%s,%s,%s,%.9f,%.9f,%.9f,ok\n",
+               bench, tune, runtime, iter, repeat, run,
+               default_s, tuned_s, ratio;
+      }' >> "$PAIR_CSV"
+  done
+}
+
+measure_pair() {
+  local bench="$1"
+  local tune_a="$2"
+  local tune_b="$3"
+  local runtime="$4"
+  local wasm_a="$5"
+  local wasm_b="$6"
+  shift 6
+
+  local times_a=()
+  local times_b=()
+  local status_a="ok"
+  local status_b="ok"
+
+  for ((run = 1; run <= REPEAT; ++run)); do
+    local first="a"
+    local second="b"
+    if ((run % 2 == 0)); then
+      first="b"
+      second="a"
+    fi
+
+    for side in "$first" "$second"; do
+      if [[ "$side" == "a" ]]; then
+        local tfile="$OUT/log/$bench.$tune_a.$runtime.$run.time"
+        local lfile="$OUT/log/$bench.$tune_a.$runtime.$run.log"
+        if [[ "$status_a" == "ok" ]] &&
+           run_timed "$tfile" "$lfile" "$@" "$wasm_a"; then
+          times_a+=("$(cat "$tfile")")
+        else
+          status_a="fail"
+        fi
+      else
+        local tfile="$OUT/log/$bench.$tune_b.$runtime.$run.time"
+        local lfile="$OUT/log/$bench.$tune_b.$runtime.$run.log"
+        if [[ "$status_b" == "ok" ]] &&
+           run_timed "$tfile" "$lfile" "$@" "$wasm_b"; then
+          times_b+=("$(cat "$tfile")")
+        else
+          status_b="fail"
+        fi
+      fi
+    done
+
+    if [[ "$status_a" != "ok" || "$status_b" != "ok" ]]; then
+      break
+    fi
+  done
+
+  emit_measure_row "$bench" "$tune_a" "$runtime" "$status_a" "${times_a[@]}"
+  emit_measure_row "$bench" "$tune_b" "$runtime" "$status_b" "${times_b[@]}"
+  if [[ "$status_a" == "ok" && "$status_b" == "ok" &&
+        ${#times_a[@]} -eq ${#times_b[@]} ]]; then
+    local pairs=()
+    for ((i = 0; i < ${#times_a[@]}; ++i)); do
+      pairs+=("${times_a[$i]}" "${times_b[$i]}")
+    done
+    emit_pair_rows "$bench" "$tune_b" "$runtime" "ok" "${pairs[@]}"
+  else
+    emit_pair_rows "$bench" "$tune_b" "$runtime" "fail"
+  fi
 }
 
 for def in "${bench_defs[@]}"; do
@@ -211,16 +348,16 @@ for def in "${bench_defs[@]}"; do
     wasm="$OUT/wasm/$bench.$tune.wasm"
     compile_wasm "$bench" "$macro" "$math" "$tune" "$wasm"
     dump_shape "$bench" "$macro" "$math" "$tune"
-    "$UWVM" "${uwvm_extra_args[@]}" --mode validation "$wasm" >"$OUT/log/$bench.$tune.validation.log" 2>&1
+    "$UWVM" "${uwvm_extra_args[@]}" "${uwvm_validation_args[@]}" "$wasm" >"$OUT/log/$bench.$tune.validation.log" 2>&1
   done
-  measure "$bench" default uwvm-rint "$OUT/wasm/$bench.default.wasm" \
-    "$UWVM" "${uwvm_extra_args[@]}" -Rint --
-  measure "$bench" "$UWVM2_TUNE" uwvm-rint "$OUT/wasm/$bench.$UWVM2_TUNE.wasm" \
-    "$UWVM" "${uwvm_extra_args[@]}" -Rint --
-  measure "$bench" default wasm3 "$OUT/wasm/$bench.default.wasm" "$WASM3"
-  measure "$bench" "$WASM3_TUNE" wasm3 "$OUT/wasm/$bench.$WASM3_TUNE.wasm" \
+  measure_pair "$bench" default "$UWVM2_TUNE" uwvm-rint \
+    "$OUT/wasm/$bench.default.wasm" "$OUT/wasm/$bench.$UWVM2_TUNE.wasm" \
+    "$UWVM" "${uwvm_extra_args[@]}" "${uwvm_run_args[@]}"
+  measure_pair "$bench" default "$WASM3_TUNE" wasm3 \
+    "$OUT/wasm/$bench.default.wasm" "$OUT/wasm/$bench.$WASM3_TUNE.wasm" \
     "$WASM3"
 done
 
 printf 'results: %s\n' "$CSV"
 printf 'shape: %s\n' "$SHAPE_CSV"
+printf 'pairs: %s\n' "$PAIR_CSV"

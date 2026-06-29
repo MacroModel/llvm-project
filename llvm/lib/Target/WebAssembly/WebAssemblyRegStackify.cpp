@@ -67,6 +67,30 @@ static cl::opt<unsigned> WasmTuneStackifyScoreHysteresis(
     cl::desc("Minimum score regression needed to veto WebAssembly "
              "profile-aware stackification"));
 
+static cl::opt<unsigned> WasmTuneM3MoveFPDistance(
+    "wasm-tune-m3-move-fp-distance", cl::Hidden, cl::init(4),
+    cl::desc("Maximum non-debug instruction distance for m3 FP moves"));
+
+static cl::opt<unsigned> WasmTuneM3TeeFPDistance(
+    "wasm-tune-m3-tee-fp-distance", cl::Hidden, cl::init(3),
+    cl::desc("Maximum non-debug instruction distance for m3 FP tees"));
+
+static cl::opt<unsigned> WasmTuneM3MaxFPStackifiedPeak(
+    "wasm-tune-m3-max-fp-stackified-peak", cl::Hidden, cl::init(3),
+    cl::desc("Maximum estimated FP stackified peak allowed by the m3 model"));
+
+static cl::opt<bool> WasmTuneUWVM2DelayLocal(
+    "wasm-tune-uwvm2-delay-local", cl::Hidden, cl::init(true),
+    cl::desc("Enable UWVM2 delay-local operand-order tuning"));
+
+static cl::opt<bool> WasmTuneUWVM2LocalGet2Scale(
+    "wasm-tune-uwvm2-localget2-scale", cl::Hidden, cl::init(true),
+    cl::desc("Enable UWVM2 local.get + scaled-address order tuning"));
+
+static cl::opt<bool> WasmTuneUWVM2ProfileCommute(
+    "wasm-tune-uwvm2-profile-commute", cl::Hidden, cl::init(true),
+    cl::desc("Enable UWVM2 profile-guided commutation"));
+
 namespace {
 class WebAssemblyRegStackify final : public MachineFunctionPass {
   bool Optimize;
@@ -1191,7 +1215,8 @@ static void countProfileVeto(const WasmExecutionProfile &Profile,
   switch (Gate.Reason) {
   case ProfileGateResult::RingOverflow:
   case ProfileGateResult::ScoreDelta:
-    if (Profile.IntRingCapacity && Gate.AfterPeakInt > Profile.IntRingCapacity) {
+    if (Profile.IntRingCapacity &&
+        Gate.AfterPeakInt > Profile.IntRingCapacity) {
       if (Gate.AfterPeakInt == Profile.IntRingCapacity + 1)
         ++Stats.IntMildOverflow;
       else
@@ -1233,9 +1258,8 @@ static void dumpTuneShapeStats(MachineFunction &MF,
     dbgs() << " tune=default";
   else
     dbgs() << " tune=" << ST.getTuneCPUName();
-  dbgs() << " move=" << Stats.Move
-         << " remat=" << Stats.Rematerialize << " tee=" << Stats.Tee
-         << " keep-local=" << Stats.KeepLocal
+  dbgs() << " move=" << Stats.Move << " remat=" << Stats.Rematerialize
+         << " tee=" << Stats.Tee << " keep-local=" << Stats.KeepLocal
          << " historical-kept=" << Stats.HistoricalKept
          << " profile-changed=" << Stats.ProfileChanged
          << " profile-commute-tried=" << Stats.ProfileCommuteTried
@@ -1254,8 +1278,7 @@ static void dumpTuneShapeStats(MachineFunction &MF,
          << " est-local-set=" << Stats.EstimatedLocalSet
          << " est-tee=" << Stats.EstimatedTee
          << " keep-local-boundary=" << Stats.KeepLocalBoundary
-         << " delay-local-rhs-commute-tried="
-         << Stats.DelayLocalRHSCommuteTried
+         << " delay-local-rhs-commute-tried=" << Stats.DelayLocalRHSCommuteTried
          << " delay-local-rhs-commute-accepted="
          << Stats.DelayLocalRHSCommuteAccepted
          << " localget2-scale-commute-tried="
@@ -1296,6 +1319,180 @@ static bool isFPMulOpcode(unsigned Opcode) {
   default:
     return false;
   }
+}
+
+static bool isFPSubOpcode(unsigned Opcode) {
+  switch (Opcode) {
+  case WebAssembly::SUB_F32:
+  case WebAssembly::SUB_F64:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static bool isFPDivOpcode(unsigned Opcode) {
+  switch (Opcode) {
+  case WebAssembly::DIV_F32:
+  case WebAssembly::DIV_F64:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static bool isFPConstOpcode(unsigned Opcode) {
+  switch (Opcode) {
+  case WebAssembly::CONST_F32:
+  case WebAssembly::CONST_F64:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static bool
+m3RelaxedFPPeakTreeImpl(const MachineInstr *MI, const MachineRegisterInfo &MRI,
+                        unsigned Limit, bool &SawProduct,
+                        SmallPtrSetImpl<const MachineInstr *> &Visiting) {
+  if (!MI)
+    return true;
+  if (Limit == 0)
+    return false;
+  if (isFPDivOpcode(MI->getOpcode()) || isFPConstOpcode(MI->getOpcode()))
+    return false;
+
+  bool IsFPArithmetic = isFPAddOpcode(MI->getOpcode()) ||
+                        isFPSubOpcode(MI->getOpcode()) ||
+                        isFPMulOpcode(MI->getOpcode());
+  if (!IsFPArithmetic)
+    return true;
+  if (!MI->getFlag(MachineInstr::FmReassoc))
+    return false;
+  if (isFPMulOpcode(MI->getOpcode()))
+    SawProduct = true;
+  if (!Visiting.insert(MI).second)
+    return true;
+
+  for (const MachineOperand &MO : MI->explicit_uses()) {
+    if (!MO.isReg() || !MO.getReg().isVirtual())
+      continue;
+    Register Reg = MO.getReg();
+    if (!isWasmFPReg(Reg, MRI))
+      continue;
+    if (!m3RelaxedFPPeakTreeImpl(MRI.getUniqueVRegDef(Reg), MRI, Limit - 1,
+                                 SawProduct, Visiting)) {
+      Visiting.erase(MI);
+      return false;
+    }
+  }
+
+  Visiting.erase(MI);
+  return true;
+}
+
+static bool canUseM3RelaxedFPPeak(Register Reg, MachineInstr *DefI,
+                                  MachineInstr *Insert,
+                                  const MachineRegisterInfo &MRI) {
+  if (!isWasmFPReg(Reg, MRI))
+    return false;
+  bool SawProduct = false;
+  SmallPtrSet<const MachineInstr *, 16> Visiting;
+  if (!m3RelaxedFPPeakTreeImpl(Insert, MRI, /*Limit=*/16, SawProduct, Visiting))
+    return false;
+  Visiting.clear();
+  if (!m3RelaxedFPPeakTreeImpl(DefI, MRI, /*Limit=*/16, SawProduct, Visiting))
+    return false;
+  return SawProduct;
+}
+
+static bool
+m3FPTreeHasDivImpl(const MachineInstr *MI, const MachineRegisterInfo &MRI,
+                   unsigned Limit,
+                   SmallPtrSetImpl<const MachineInstr *> &Visiting) {
+  if (!MI || Limit == 0)
+    return false;
+  if (isFPDivOpcode(MI->getOpcode()))
+    return true;
+  if (!Visiting.insert(MI).second)
+    return false;
+
+  for (const MachineOperand &MO : MI->explicit_uses()) {
+    if (!MO.isReg() || !MO.getReg().isVirtual())
+      continue;
+    Register Reg = MO.getReg();
+    if (!isWasmFPReg(Reg, MRI))
+      continue;
+    if (m3FPTreeHasDivImpl(MRI.getUniqueVRegDef(Reg), MRI, Limit - 1,
+                           Visiting)) {
+      Visiting.erase(MI);
+      return true;
+    }
+  }
+
+  Visiting.erase(MI);
+  return false;
+}
+
+static bool m3CandidateTreeHasFPDiv(MachineInstr *DefI, MachineInstr *Insert,
+                                    const MachineRegisterInfo &MRI) {
+  SmallPtrSet<const MachineInstr *, 16> Visiting;
+  if (m3FPTreeHasDivImpl(Insert, MRI, /*Limit=*/16, Visiting))
+    return true;
+  Visiting.clear();
+  return m3FPTreeHasDivImpl(DefI, MRI, /*Limit=*/16, Visiting);
+}
+
+static bool m3FPTreeHasStrictArithmeticImpl(
+    const MachineInstr *MI, const MachineRegisterInfo &MRI, unsigned Limit,
+    SmallPtrSetImpl<const MachineInstr *> &Visiting) {
+  if (!MI || Limit == 0)
+    return false;
+  bool IsFPArithmetic = isFPAddOpcode(MI->getOpcode()) ||
+                        isFPSubOpcode(MI->getOpcode()) ||
+                        isFPMulOpcode(MI->getOpcode());
+  if (IsFPArithmetic && !MI->getFlag(MachineInstr::FmReassoc))
+    return true;
+  if (!Visiting.insert(MI).second)
+    return false;
+
+  for (const MachineOperand &MO : MI->explicit_uses()) {
+    if (!MO.isReg() || !MO.getReg().isVirtual())
+      continue;
+    Register Reg = MO.getReg();
+    if (!isWasmFPReg(Reg, MRI))
+      continue;
+    if (m3FPTreeHasStrictArithmeticImpl(MRI.getUniqueVRegDef(Reg), MRI,
+                                        Limit - 1, Visiting)) {
+      Visiting.erase(MI);
+      return true;
+    }
+  }
+
+  Visiting.erase(MI);
+  return false;
+}
+
+static bool
+m3CandidateTreeHasStrictFPArithmetic(MachineInstr *DefI, MachineInstr *Insert,
+                                     const MachineRegisterInfo &MRI) {
+  SmallPtrSet<const MachineInstr *, 16> Visiting;
+  if (m3FPTreeHasStrictArithmeticImpl(Insert, MRI, /*Limit=*/16, Visiting))
+    return true;
+  Visiting.clear();
+  return m3FPTreeHasStrictArithmeticImpl(DefI, MRI, /*Limit=*/16, Visiting);
+}
+
+static bool shouldBypassM3FPGatesForThroughputTree(
+    WasmValueClass VC, MachineInstr *DefI, MachineInstr *Insert,
+    const MachineRegisterInfo &MRI, const WasmExecPressureResult &R) {
+  if (VC != WasmValueClass::FP)
+    return false;
+  if (m3CandidateTreeHasFPDiv(DefI, Insert, MRI))
+    return false;
+  if (R.PeakInt >= 4)
+    return true;
+  return m3CandidateTreeHasStrictFPArithmetic(DefI, Insert, MRI);
 }
 
 // Product-bank splitting is allowed to bias local boundaries, but not to change
@@ -1358,9 +1555,10 @@ static bool expressionTreeHasMemoryOrCallImpl(
   return false;
 }
 
-static bool expressionTreeHasMemoryOrCall(
-    const MachineInstr *Root, Register CandidateReg,
-    const MachineInstr *CandidateDef, const MachineRegisterInfo &MRI) {
+static bool expressionTreeHasMemoryOrCall(const MachineInstr *Root,
+                                          Register CandidateReg,
+                                          const MachineInstr *CandidateDef,
+                                          const MachineRegisterInfo &MRI) {
   SmallPtrSet<const MachineInstr *, 16> Visiting;
   if (expressionTreeHasMemoryOrCallImpl(Root, MRI, WasmTuneStackifyNodeLimit,
                                         Visiting))
@@ -1396,11 +1594,11 @@ static unsigned countReassocFPProductBankProductsImpl(
   return Products;
 }
 
-static unsigned countReassocFPProductBankProducts(
-    const MachineInstr *MI, const MachineRegisterInfo &MRI) {
+static unsigned
+countReassocFPProductBankProducts(const MachineInstr *MI,
+                                  const MachineRegisterInfo &MRI) {
   SmallPtrSet<const MachineInstr *, 16> Visiting;
-  return countReassocFPProductBankProductsImpl(MI, MRI, /*Limit=*/16,
-                                               Visiting);
+  return countReassocFPProductBankProductsImpl(MI, MRI, /*Limit=*/16, Visiting);
 }
 
 static bool isReassocFPProductBankEdge(Register Reg, MachineInstr *DefI,
@@ -1484,9 +1682,9 @@ static bool strictFPTreeHasMultiUseFPInput(const MachineInstr *MI,
   return strictFPTreeHasMultiUseFPInputImpl(MI, MRI, /*Limit=*/16, Visiting);
 }
 
-static bool strictFPAccumEdgeHasReusableInput(
-    const MachineInstr *DefI, const MachineInstr *Insert,
-    const MachineRegisterInfo &MRI) {
+static bool strictFPAccumEdgeHasReusableInput(const MachineInstr *DefI,
+                                              const MachineInstr *Insert,
+                                              const MachineRegisterInfo &MRI) {
   if (strictFPTreeHasMultiUseFPInput(DefI, MRI))
     return true;
   if (!Insert)
@@ -1545,7 +1743,7 @@ static ProfileGateResult profileGateU2Delta(const WebAssemblySubtarget &ST,
     Reason = "ring-overflow";
     VetoReason = ProfileGateResult::RingOverflow;
   } else if (shouldPreferUWVM2StrictFPAccumBoundary(Profile, Reg, DefI, Insert,
-                                                   MRI, After)) {
+                                                    MRI, After)) {
     Allow = false;
     Reason = "uwvm2-strict-fp-accum";
     VetoReason = ProfileGateResult::UWVM2StrictFPAccum;
@@ -1611,8 +1809,8 @@ static ProfileGateResult profileGateMove(const WebAssemblySubtarget &ST,
       LLVM_DEBUG(dbgs() << "wasm-tune-stackify: veto"
                         << " tune=" << ST.getTuneCPUName()
                         << " action=move reason=uwvm2-move-int-boundary"
-                        << " reg=" << Reg << " cap-int="
-                        << Profile.IntRingCapacity << " instr=";
+                        << " reg=" << Reg
+                        << " cap-int=" << Profile.IntRingCapacity << " instr=";
                  Insert->print(dbgs()));
     }
     return Result;
@@ -1629,11 +1827,20 @@ static ProfileGateResult profileGateMove(const WebAssemblySubtarget &ST,
   StringRef Reason;
   ProfileGateResult::VetoReason VetoReason = ProfileGateResult::None;
   unsigned Dist = nonDebugDistance(DefI, Insert, /*Limit=*/16);
-  if (VC == WasmValueClass::FP && Dist > 4) {
+  bool BypassFPGates =
+      shouldBypassM3FPGatesForThroughputTree(VC, DefI, Insert, MRI, R);
+  unsigned MaxFPPeak = WasmTuneM3MaxFPStackifiedPeak;
+  if (BypassFPGates)
+    MaxFPPeak = ~0u;
+  else if (VC == WasmValueClass::FP && R.PeakFP > 2 &&
+           !canUseM3RelaxedFPPeak(Reg, DefI, Insert, MRI))
+    MaxFPPeak = std::min(MaxFPPeak, 2u);
+  if (!BypassFPGates && VC == WasmValueClass::FP && R.PeakFP > 1 &&
+      Dist > WasmTuneM3MoveFPDistance) {
     Allow = false;
     Reason = "m3-fp-distance";
     VetoReason = ProfileGateResult::M3FPDistance;
-  } else if (VC == WasmValueClass::FP && R.PeakFP > 2) {
+  } else if (VC == WasmValueClass::FP && R.PeakFP > MaxFPPeak) {
     Allow = false;
     Reason = "m3-fp-bank";
     VetoReason = ProfileGateResult::M3FPBank;
@@ -1772,8 +1979,8 @@ static ProfileGateResult profileGateTee(const WebAssemblySubtarget &ST,
       LLVM_DEBUG(dbgs() << "wasm-tune-stackify: veto"
                         << " tune=" << ST.getTuneCPUName()
                         << " action=tee reason=uwvm2-tee-int-boundary"
-                        << " reg=" << Reg << " cap-int="
-                        << Profile.IntRingCapacity << " instr=";
+                        << " reg=" << Reg
+                        << " cap-int=" << Profile.IntRingCapacity << " instr=";
                  Insert->print(dbgs()));
     }
     return Result;
@@ -1791,11 +1998,20 @@ static ProfileGateResult profileGateTee(const WebAssemblySubtarget &ST,
   bool Allow = true;
   StringRef Reason;
   ProfileGateResult::VetoReason VetoReason = ProfileGateResult::None;
-  if (VC == WasmValueClass::FP && Dist > 3) {
+  bool BypassFPGates =
+      shouldBypassM3FPGatesForThroughputTree(VC, DefI, Insert, MRI, R);
+  unsigned MaxFPPeak = WasmTuneM3MaxFPStackifiedPeak;
+  if (BypassFPGates)
+    MaxFPPeak = ~0u;
+  else if (VC == WasmValueClass::FP && R.PeakFP > 2 &&
+           !canUseM3RelaxedFPPeak(Reg, DefI, Insert, MRI))
+    MaxFPPeak = std::min(MaxFPPeak, 2u);
+  if (!BypassFPGates && VC == WasmValueClass::FP && R.PeakFP > 1 &&
+      Dist > WasmTuneM3TeeFPDistance) {
     Allow = false;
     Reason = "m3-tee-distance";
     VetoReason = ProfileGateResult::M3TeeDistance;
-  } else if (VC == WasmValueClass::FP && R.PeakFP > 2) {
+  } else if (VC == WasmValueClass::FP && R.PeakFP > MaxFPPeak) {
     Allow = false;
     Reason = "m3-fp-bank";
     VetoReason = ProfileGateResult::M3FPBank;
@@ -2115,8 +2331,7 @@ static bool isUWVM2I32LocalImmScaleTree(const MachineOperand &MO,
   if (!MO.isReg() || !MO.isUse() || MO.isUndef())
     return false;
   Register Reg = MO.getReg();
-  if (!Reg.isVirtual() || !MFI.isVRegStackified(Reg) ||
-      !isWasmIntReg(Reg, MRI))
+  if (!Reg.isVirtual() || !MFI.isVRegStackified(Reg) || !isWasmIntReg(Reg, MRI))
     return false;
 
   MachineInstr *DefI = MRI.getUniqueVRegDef(Reg);
@@ -2143,9 +2358,10 @@ static bool isUWVM2I32LocalImmScaleTree(const MachineOperand &MO,
          isUWVM2I32ConstLeaf(*Uses[1], MRI, TII);
 }
 
-static bool commuteInPlacePreservingRegUseFlags(
-    MachineInstr *Insert, const WebAssemblyInstrInfo *TII, unsigned Operand0,
-    unsigned Operand1) {
+static bool commuteInPlacePreservingRegUseFlags(MachineInstr *Insert,
+                                                const WebAssemblyInstrInfo *TII,
+                                                unsigned Operand0,
+                                                unsigned Operand1) {
   MachineInstr *Commuted =
       TII->commuteInstruction(*Insert, /*NewMI=*/false, Operand0, Operand1);
   if (Commuted)
@@ -2188,7 +2404,8 @@ static bool maybeCommuteUWVM2DelayLocalRHS(
     const WebAssemblyInstrInfo *TII, Register CandidateReg,
     MachineInstr *CandidateDef, WasmTuneShapeStats *ShapeStats = nullptr) {
   const WasmExecutionProfile &Profile = ST.getExecutionProfile();
-  if (!Profile.HasUWVM2RegisterRingModel || !shouldUseProfileGate(Profile, Insert))
+  if (!Profile.HasUWVM2RegisterRingModel ||
+      !shouldUseProfileGate(Profile, Insert) || !WasmTuneUWVM2DelayLocal)
     return false;
   if (Insert->isInlineAsm() || Insert->mayLoad() || Insert->mayStore() ||
       Insert->isCall())
@@ -2216,10 +2433,10 @@ static bool maybeCommuteUWVM2DelayLocalRHS(
     return false;
 
   // This commute intentionally may move a pure local.get after a subtree that
-  // contains loads. The local.get has no side effects and cannot trap, while the
-  // load subtree keeps its internal order. That shape lets UWVM2 consume the
-  // subtree through its small integer register ring before materializing the
-  // local value on the Wasm stack.
+  // contains loads. The local.get has no side effects and cannot trap, while
+  // the load subtree keeps its internal order. That shape lets UWVM2 consume
+  // the subtree through its small integer register ring before materializing
+  // the local value on the Wasm stack.
   MachineInstr *Commuted =
       TII->commuteInstruction(*Insert, /*NewMI=*/false, Operand0, Operand1);
   if (!Commuted)
@@ -2239,11 +2456,10 @@ static bool maybeCommuteUWVM2DelayLocalRHS(
 static bool maybePostStackifyCommuteUWVM2DelayLocalRHS(
     MachineInstr *Insert, const WebAssemblySubtarget &ST,
     const MachineRegisterInfo &MRI, const WebAssemblyFunctionInfo &MFI,
-    const WebAssemblyInstrInfo *TII,
-    WasmTuneShapeStats *ShapeStats = nullptr) {
+    const WebAssemblyInstrInfo *TII, WasmTuneShapeStats *ShapeStats = nullptr) {
   const WasmExecutionProfile &Profile = ST.getExecutionProfile();
   if (!Profile.HasUWVM2RegisterRingModel ||
-      !shouldUseProfileGate(Profile, Insert))
+      !shouldUseProfileGate(Profile, Insert) || !WasmTuneUWVM2DelayLocal)
     return false;
   if (Insert->isInlineAsm() || Insert->mayLoad() || Insert->mayStore() ||
       Insert->isCall())
@@ -2281,11 +2497,11 @@ static bool maybePostStackifyCommuteUWVM2DelayLocalRHS(
 static bool maybePostStackifyCommuteUWVM2LocalGet2Scale(
     MachineInstr *Insert, const WebAssemblySubtarget &ST,
     const MachineRegisterInfo &MRI, const WebAssemblyFunctionInfo &MFI,
-    const WebAssemblyInstrInfo *TII,
-    WasmTuneShapeStats *ShapeStats = nullptr) {
+    const WebAssemblyInstrInfo *TII, WasmTuneShapeStats *ShapeStats = nullptr) {
   const WasmExecutionProfile &Profile = ST.getExecutionProfile();
   if (!Profile.HasUWVM2RegisterRingModel ||
-      !shouldUseProfileGate(Profile, Insert) || Profile.IntRingCapacity < 3)
+      !shouldUseProfileGate(Profile, Insert) || !WasmTuneUWVM2LocalGet2Scale ||
+      Profile.IntRingCapacity < 3)
     return false;
   if (Insert->isInlineAsm() || Insert->mayLoad() || Insert->mayStore() ||
       Insert->isCall())
@@ -2463,8 +2679,7 @@ bool WebAssemblyRegStackify::runOnMachineFunction(MachineFunction &MF) {
             WasmST.getExecutionProfile().HasUWVM2RegisterRingModel &&
             !DelayLocalRHSCommuteTried.contains(Insert) &&
             maybeCommuteUWVM2DelayLocalRHS(Insert, Use, TreeWalker, WasmST, MRI,
-                                           MFI, TII, Reg, DefI,
-                                           &ShapeStats)) {
+                                           MFI, TII, Reg, DefI, &ShapeStats)) {
           DelayLocalRHSCommuteTried.insert(Insert);
           Commuting.reset();
           Changed = true;
@@ -2473,11 +2688,11 @@ bool WebAssemblyRegStackify::runOnMachineFunction(MachineFunction &MF) {
 
         if (SameBlock && MoveLegal && MoveGate.Allow &&
             WasmST.getExecutionProfile().HasUWVM2RegisterRingModel &&
+            WasmTuneUWVM2ProfileCommute &&
             !expressionTreeHasMemoryOrCall(Insert, Reg, DefI, MRI) &&
             !ProfileCommuteTried.contains(Insert) &&
             maybeProfileCommuteForCandidate(Insert, TreeWalker, WasmST, MRI,
-                                            MFI, TII, Reg, DefI,
-                                            &ShapeStats)) {
+                                            MFI, TII, Reg, DefI, &ShapeStats)) {
           ProfileCommuteTried.insert(Insert);
           Commuting.reset();
           Changed = true;
@@ -2487,10 +2702,9 @@ bool WebAssemblyRegStackify::runOnMachineFunction(MachineFunction &MF) {
         StackifyActionKind SelectedAction = StackifyActionKind::KeepLocal;
         if (shouldUseProfileGate(WasmST.getExecutionProfile(), Insert)) {
           SelectedAction =
-              chooseProfileActionCandidate(WasmST, Reg, DefI, Insert, MRI, MFI,
-                                           MoveLegal, MoveGate, RematLegal,
-                                           RematGate, TeeLegal, TeeGate,
-                                           &ShapeStats)
+              chooseProfileActionCandidate(
+                  WasmST, Reg, DefI, Insert, MRI, MFI, MoveLegal, MoveGate,
+                  RematLegal, RematGate, TeeLegal, TeeGate, &ShapeStats)
                   .Kind;
         } else if (MoveLegal && MoveGate.Allow) {
           SelectedAction = StackifyActionKind::Move;
@@ -2543,6 +2757,8 @@ bool WebAssemblyRegStackify::runOnMachineFunction(MachineFunction &MF) {
           // We failed to stackify the operand. If the problem was ordering
           // constraints, Commuting may be able to help.
           if (SameBlock && ProfileVetoed && !HasAllowedStackify &&
+              (!WasmST.getExecutionProfile().HasUWVM2RegisterRingModel ||
+               WasmTuneUWVM2ProfileCommute) &&
               !ProfileCommuteTried.contains(Insert) &&
               maybeProfileCommuteForCandidate(Insert, TreeWalker, WasmST, MRI,
                                               MFI, TII, ProfileVetoReg,
@@ -2605,8 +2821,8 @@ bool WebAssemblyRegStackify::runOnMachineFunction(MachineFunction &MF) {
   if (WasmST.getExecutionProfile().HasUWVM2RegisterRingModel) {
     for (MachineBasicBlock &MBB : MF) {
       for (MachineInstr &MI : MBB) {
-        if (maybePostStackifyCommuteUWVM2DelayLocalRHS(
-                &MI, WasmST, MRI, MFI, TII, &ShapeStats)) {
+        if (maybePostStackifyCommuteUWVM2DelayLocalRHS(&MI, WasmST, MRI, MFI,
+                                                       TII, &ShapeStats)) {
           Changed = true;
           continue;
         }

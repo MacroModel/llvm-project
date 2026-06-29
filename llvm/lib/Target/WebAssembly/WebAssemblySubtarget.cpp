@@ -38,10 +38,10 @@ static WasmExecutionProfile computeExecutionProfile(StringRef TuneCPU) {
     Profile.HasRegisterRing = true;
     Profile.HasUWVM2RegisterRingModel = true;
     Profile.FPRingCapacity = 8;
+    Profile.FPTuningBoundary = 12;
     Profile.IntRingCapacity = 5;
-    Profile.IntTuningBoundary = 5;
-    if (TuneCPU.starts_with("uwvm2"))
-      Profile.StrictFPAccumBoundary = 2;
+    Profile.IntTuningBoundary = 7;
+    Profile.StrictFPAccumBoundary = 2;
     Profile.PreferredFPBank = 8;
     Profile.PreferredIntBank = 5;
     Profile.SpillCost = 5;
@@ -65,8 +65,8 @@ static WasmExecutionProfile computeExecutionProfile(StringRef TuneCPU) {
     return Profile;
   }
 
-  if (TuneCPU == "uwvm2" || TuneCPU == "uwvm2-int" ||
-      TuneCPU == "uwvm2-sysv" || TuneCPU == "uwvm2-x86_64-sysv") {
+  if (TuneCPU == "uwvm2" || TuneCPU == "uwvm2-int" || TuneCPU == "uwvm2-sysv" ||
+      TuneCPU == "uwvm2-x86_64-sysv") {
     Profile.Kind = WasmTuneKind::U2SysV;
     Profile.HasRegisterRing = true;
     Profile.HasUWVM2RegisterRingModel = true;
