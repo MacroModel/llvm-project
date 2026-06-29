@@ -2020,8 +2020,7 @@ static bool maybeCommuteUWVM2DelayLocalRHS(
     ++ShapeStats->DelayLocalRHSCommuteTried;
 
   MachineOperand &LHS = Insert->getOperand(Operand0);
-  if (!isUWVM2DelayLocalLeaf(LHS, MRI, MFI, TII,
-                             /*IncludeSingleUse=*/true))
+  if (!isUWVM2DelayLocalLeaf(LHS, MRI, MFI, TII))
     return false;
 
   // This commute intentionally may move a pure local.get after a subtree that
@@ -2064,7 +2063,8 @@ static bool maybePostStackifyCommuteUWVM2DelayLocalRHS(
     return false;
 
   MachineOperand &LHS = Insert->getOperand(Operand0);
-  if (!isUWVM2DelayLocalLeaf(LHS, MRI, MFI, TII))
+  if (!isUWVM2DelayLocalLeaf(LHS, MRI, MFI, TII,
+                             /*IncludeSingleUse=*/true))
     return false;
   if (!shouldAvoidUWVM2TeeUnderLaterIntOperand(Profile, LHS, MRI, MFI))
     return false;

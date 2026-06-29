@@ -63,6 +63,7 @@ entry:
 ; U2-SYSV-NEXT: local.set
 ; U2-SYSV-NOT: local.tee
 ; U2-SYSV: i32.xor
+; U2-SYSV-NEXT: local.get
 ; U2-SYSV-NEXT: i32.add
 ; U2-SYSV-NEXT: local.get
 ; U2-SYSV-NEXT: i32.add
@@ -72,6 +73,7 @@ entry:
 ; UWVM2-NEXT: local.set
 ; UWVM2-NOT: local.tee
 ; UWVM2: i32.xor
+; UWVM2-NEXT: local.get
 ; UWVM2-NEXT: i32.add
 ; UWVM2-NEXT: local.get
 ; UWVM2-NEXT: i32.add
