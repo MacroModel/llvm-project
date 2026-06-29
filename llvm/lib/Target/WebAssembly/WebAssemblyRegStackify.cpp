@@ -27,6 +27,7 @@
 #include "WebAssemblySubtarget.h"
 #include "WebAssemblyUtilities.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/LiveIntervals.h"
 #include "llvm/CodeGen/MachineBlockFrequencyInfo.h"
 #include "llvm/CodeGen/MachineDominators.h"
@@ -1081,6 +1082,7 @@ struct ProfileGateResult {
     M3FPBank,
     M3TeeDistance,
     UWVM2StrictFPAccum,
+    UWVM2MoveIntBoundary,
     UWVM2TeeIntBoundary,
   } Reason = None;
   unsigned AfterPeakFP = 0;
@@ -1118,6 +1120,7 @@ struct WasmTuneShapeStats {
   uint64_t M3FPBank = 0;
   uint64_t M3Distance = 0;
   uint64_t UWVM2StrictFPAccum = 0;
+  uint64_t UWVM2MoveIntBoundary = 0;
   uint64_t UWVM2TeeIntBoundary = 0;
   uint64_t EstimatedLocalGet = 0;
   uint64_t EstimatedLocalSet = 0;
@@ -1125,6 +1128,8 @@ struct WasmTuneShapeStats {
   uint64_t KeepLocalBoundary = 0;
   uint64_t DelayLocalRHSCommuteTried = 0;
   uint64_t DelayLocalRHSCommuteAccepted = 0;
+  uint64_t LocalGet2ScaleCommuteTried = 0;
+  uint64_t LocalGet2ScaleCommuteAccepted = 0;
 };
 
 static StringRef actionName(StackifyActionKind Kind) {
@@ -1187,6 +1192,9 @@ static void countProfileVeto(const WasmExecutionProfile &Profile,
   case ProfileGateResult::UWVM2StrictFPAccum:
     ++Stats.UWVM2StrictFPAccum;
     break;
+  case ProfileGateResult::UWVM2MoveIntBoundary:
+    ++Stats.UWVM2MoveIntBoundary;
+    break;
   case ProfileGateResult::UWVM2TeeIntBoundary:
     ++Stats.UWVM2TeeIntBoundary;
     break;
@@ -1222,6 +1230,7 @@ static void dumpTuneShapeStats(MachineFunction &MF,
          << " m3-fp-bank=" << Stats.M3FPBank
          << " m3-distance=" << Stats.M3Distance
          << " uwvm2-strict-fp-accum=" << Stats.UWVM2StrictFPAccum
+         << " uwvm2-move-int-boundary=" << Stats.UWVM2MoveIntBoundary
          << " uwvm2-tee-int-boundary=" << Stats.UWVM2TeeIntBoundary
          << " est-local-get=" << Stats.EstimatedLocalGet
          << " est-local-set=" << Stats.EstimatedLocalSet
@@ -1230,7 +1239,11 @@ static void dumpTuneShapeStats(MachineFunction &MF,
          << " delay-local-rhs-commute-tried="
          << Stats.DelayLocalRHSCommuteTried
          << " delay-local-rhs-commute-accepted="
-         << Stats.DelayLocalRHSCommuteAccepted << "\n";
+         << Stats.DelayLocalRHSCommuteAccepted
+         << " localget2-scale-commute-tried="
+         << Stats.LocalGet2ScaleCommuteTried
+         << " localget2-scale-commute-accepted="
+         << Stats.LocalGet2ScaleCommuteAccepted << "\n";
 }
 
 static unsigned actionPriority(StackifyActionKind Kind) {
@@ -1500,9 +1513,14 @@ static ProfileGateResult profileGateU2Delta(const WebAssemblySubtarget &ST,
   return Result;
 }
 
+static bool shouldAvoidUWVM2StackifyUnderLaterIntOperand(
+    const WasmExecutionProfile &Profile, const MachineOperand &Use,
+    const MachineRegisterInfo &MRI, const WebAssemblyFunctionInfo &MFI);
+
 static ProfileGateResult profileGateMove(const WebAssemblySubtarget &ST,
                                          Register Reg, MachineInstr *DefI,
                                          MachineInstr *Insert,
+                                         const MachineOperand &Use,
                                          const MachineRegisterInfo &MRI,
                                          const WebAssemblyFunctionInfo &MFI) {
   const WasmExecutionProfile &Profile = ST.getExecutionProfile();
@@ -1510,8 +1528,23 @@ static ProfileGateResult profileGateMove(const WebAssemblySubtarget &ST,
     return {};
 
   WasmValueClass VC = classifyWasmReg(Reg, MRI);
-  if (Profile.HasRegisterRing)
-    return profileGateU2Delta(ST, Reg, DefI, Insert, MRI, MFI, "move");
+  if (Profile.HasRegisterRing) {
+    ProfileGateResult Result =
+        profileGateU2Delta(ST, Reg, DefI, Insert, MRI, MFI, "move");
+    if (Result.Allow &&
+        shouldAvoidUWVM2StackifyUnderLaterIntOperand(Profile, Use, MRI, MFI)) {
+      Result.Allow = false;
+      Result.ProfileVeto = true;
+      Result.Reason = ProfileGateResult::UWVM2MoveIntBoundary;
+      LLVM_DEBUG(dbgs() << "wasm-tune-stackify: veto"
+                        << " tune=" << ST.getTuneCPUName()
+                        << " action=move reason=uwvm2-move-int-boundary"
+                        << " reg=" << Reg << " cap-int="
+                        << Profile.IntRingCapacity << " instr=";
+                 Insert->print(dbgs()));
+    }
+    return Result;
+  }
 
   if (!Profile.HasM3SlotProviderModel)
     return {};
@@ -1615,7 +1648,7 @@ estimateUWVM2LaterOperandPressure(const MachineOperand &MO,
   return R;
 }
 
-static bool shouldAvoidUWVM2TeeUnderLaterIntOperand(
+static bool shouldAvoidUWVM2StackifyUnderLaterIntOperand(
     const WasmExecutionProfile &Profile, const MachineOperand &Use,
     const MachineRegisterInfo &MRI, const WebAssemblyFunctionInfo &MFI) {
   if (!Profile.HasUWVM2RegisterRingModel || !Profile.IntRingCapacity)
@@ -1660,7 +1693,7 @@ static ProfileGateResult profileGateTee(const WebAssemblySubtarget &ST,
     ProfileGateResult Result =
         profileGateU2Delta(ST, Reg, DefI, Insert, MRI, MFI, "tee");
     if (Result.Allow &&
-        shouldAvoidUWVM2TeeUnderLaterIntOperand(Profile, Use, MRI, MFI)) {
+        shouldAvoidUWVM2StackifyUnderLaterIntOperand(Profile, Use, MRI, MFI)) {
       Result.Allow = false;
       Result.ProfileVeto = true;
       Result.Reason = ProfileGateResult::UWVM2TeeIntBoundary;
@@ -1989,6 +2022,93 @@ static bool isUWVM2DelayLocalLeaf(const MachineOperand &MO,
   return !MRI.hasOneNonDBGUse(Reg);
 }
 
+static bool isUWVM2I32ConstLeaf(const MachineOperand &MO,
+                                const MachineRegisterInfo &MRI,
+                                const WebAssemblyInstrInfo *TII) {
+  if (!MO.isReg() || !MO.isUse() || MO.isUndef())
+    return false;
+  Register Reg = MO.getReg();
+  if (!Reg.isVirtual() || !isWasmIntReg(Reg, MRI))
+    return false;
+
+  MachineInstr *DefI = MRI.getUniqueVRegDef(Reg);
+  return DefI && DefI->getOpcode() == WebAssembly::CONST_I32 &&
+         shouldRematerialize(*DefI, TII);
+}
+
+static bool isUWVM2I32LocalImmScaleTree(const MachineOperand &MO,
+                                        const MachineRegisterInfo &MRI,
+                                        const WebAssemblyFunctionInfo &MFI,
+                                        const WebAssemblyInstrInfo *TII) {
+  if (!MO.isReg() || !MO.isUse() || MO.isUndef())
+    return false;
+  Register Reg = MO.getReg();
+  if (!Reg.isVirtual() || !MFI.isVRegStackified(Reg) ||
+      !isWasmIntReg(Reg, MRI))
+    return false;
+
+  MachineInstr *DefI = MRI.getUniqueVRegDef(Reg);
+  if (!DefI)
+    return false;
+  switch (DefI->getOpcode()) {
+  case WebAssembly::MUL_I32:
+  case WebAssembly::SHL_I32:
+    break;
+  default:
+    return false;
+  }
+
+  SmallVector<const MachineOperand *, 2> Uses;
+  for (const MachineOperand &Use : DefI->explicit_uses()) {
+    if (Use.isReg())
+      Uses.push_back(&Use);
+  }
+  if (Uses.size() != 2)
+    return false;
+
+  return isUWVM2DelayLocalLeaf(*Uses[0], MRI, MFI, TII,
+                               /*IncludeSingleUse=*/true) &&
+         isUWVM2I32ConstLeaf(*Uses[1], MRI, TII);
+}
+
+static bool commuteInPlacePreservingRegUseFlags(
+    MachineInstr *Insert, const WebAssemblyInstrInfo *TII, unsigned Operand0,
+    unsigned Operand1) {
+  MachineInstr *Commuted =
+      TII->commuteInstruction(*Insert, /*NewMI=*/false, Operand0, Operand1);
+  if (Commuted)
+    return true;
+
+  MachineOperand &LHS = Insert->getOperand(Operand0);
+  MachineOperand &RHS = Insert->getOperand(Operand1);
+  if (!LHS.isReg() || !RHS.isReg() || !LHS.isUse() || !RHS.isUse() ||
+      LHS.isImplicit() || RHS.isImplicit())
+    return false;
+
+  Register LHSReg = LHS.getReg();
+  Register RHSReg = RHS.getReg();
+  unsigned LHSSubReg = LHS.getSubReg();
+  unsigned RHSSubReg = RHS.getSubReg();
+  bool LHSKill = LHS.isKill();
+  bool RHSKill = RHS.isKill();
+  bool LHSUndef = LHS.isUndef();
+  bool RHSUndef = RHS.isUndef();
+  bool LHSInternalRead = LHS.isInternalRead();
+  bool RHSInternalRead = RHS.isInternalRead();
+
+  LHS.setReg(RHSReg);
+  LHS.setSubReg(RHSSubReg);
+  LHS.setIsKill(RHSKill);
+  LHS.setIsUndef(RHSUndef);
+  LHS.setIsInternalRead(RHSInternalRead);
+  RHS.setReg(LHSReg);
+  RHS.setSubReg(LHSSubReg);
+  RHS.setIsKill(LHSKill);
+  RHS.setIsUndef(LHSUndef);
+  RHS.setIsInternalRead(LHSInternalRead);
+  return true;
+}
+
 static bool maybeCommuteUWVM2DelayLocalRHS(
     MachineInstr *Insert, MachineOperand &CandidateUse,
     TreeWalkerState &TreeWalker, const WebAssemblySubtarget &ST,
@@ -2066,48 +2186,70 @@ static bool maybePostStackifyCommuteUWVM2DelayLocalRHS(
   if (!isUWVM2DelayLocalLeaf(LHS, MRI, MFI, TII,
                              /*IncludeSingleUse=*/true))
     return false;
-  if (!shouldAvoidUWVM2TeeUnderLaterIntOperand(Profile, LHS, MRI, MFI))
+  if (!shouldAvoidUWVM2StackifyUnderLaterIntOperand(Profile, LHS, MRI, MFI))
     return false;
 
   if (ShapeStats)
     ++ShapeStats->DelayLocalRHSCommuteTried;
 
-  MachineInstr *Commuted =
-      TII->commuteInstruction(*Insert, /*NewMI=*/false, Operand0, Operand1);
-  if (!Commuted) {
-    MachineOperand &RHS = Insert->getOperand(Operand1);
-    if (!LHS.isReg() || !RHS.isReg() || !LHS.isUse() || !RHS.isUse() ||
-        LHS.isImplicit() || RHS.isImplicit())
-      return false;
-
-    Register LHSReg = LHS.getReg();
-    Register RHSReg = RHS.getReg();
-    unsigned LHSSubReg = LHS.getSubReg();
-    unsigned RHSSubReg = RHS.getSubReg();
-    bool LHSKill = LHS.isKill();
-    bool RHSKill = RHS.isKill();
-    bool LHSUndef = LHS.isUndef();
-    bool RHSUndef = RHS.isUndef();
-    bool LHSInternalRead = LHS.isInternalRead();
-    bool RHSInternalRead = RHS.isInternalRead();
-
-    LHS.setReg(RHSReg);
-    LHS.setSubReg(RHSSubReg);
-    LHS.setIsKill(RHSKill);
-    LHS.setIsUndef(RHSUndef);
-    LHS.setIsInternalRead(RHSInternalRead);
-    RHS.setReg(LHSReg);
-    RHS.setSubReg(LHSSubReg);
-    RHS.setIsKill(LHSKill);
-    RHS.setIsUndef(LHSUndef);
-    RHS.setIsInternalRead(LHSInternalRead);
-  }
+  if (!commuteInPlacePreservingRegUseFlags(Insert, TII, Operand0, Operand1))
+    return false;
 
   if (ShapeStats)
     ++ShapeStats->DelayLocalRHSCommuteAccepted;
 
   LLVM_DEBUG({
     dbgs() << "wasm-tune-stackify: post-delay-local-rhs-commute"
+           << " tune=" << ST.getTuneCPUName() << " instr=";
+    Insert->print(dbgs());
+  });
+  return true;
+}
+
+static bool maybePostStackifyCommuteUWVM2LocalGet2Scale(
+    MachineInstr *Insert, const WebAssemblySubtarget &ST,
+    const MachineRegisterInfo &MRI, const WebAssemblyFunctionInfo &MFI,
+    const WebAssemblyInstrInfo *TII,
+    WasmTuneShapeStats *ShapeStats = nullptr) {
+  const WasmExecutionProfile &Profile = ST.getExecutionProfile();
+  if (!Profile.HasUWVM2RegisterRingModel ||
+      !shouldUseProfileGate(Profile, Insert) || Profile.IntRingCapacity < 3)
+    return false;
+  if (Insert->isInlineAsm() || Insert->mayLoad() || Insert->mayStore() ||
+      Insert->isCall())
+    return false;
+  if (Insert->getOpcode() != WebAssembly::ADD_I32)
+    return false;
+
+  unsigned Operand0 = TargetInstrInfo::CommuteAnyOperandIndex;
+  unsigned Operand1 = TargetInstrInfo::CommuteAnyOperandIndex;
+  if (!TII->findCommutedOpIndices(*Insert, Operand0, Operand1))
+    return false;
+
+  MachineOperand &LHS = Insert->getOperand(Operand0);
+  MachineOperand &RHS = Insert->getOperand(Operand1);
+  if (!isUWVM2I32LocalImmScaleTree(LHS, MRI, MFI, TII))
+    return false;
+  if (!isUWVM2DelayLocalLeaf(RHS, MRI, MFI, TII,
+                             /*IncludeSingleUse=*/true))
+    return false;
+
+  WasmExecPressureResult ScalePressure =
+      estimateUWVM2LaterOperandPressure(LHS, MRI, MFI);
+  if (1 + ScalePressure.PeakInt > Profile.IntRingCapacity)
+    return false;
+
+  if (ShapeStats)
+    ++ShapeStats->LocalGet2ScaleCommuteTried;
+
+  if (!commuteInPlacePreservingRegUseFlags(Insert, TII, Operand0, Operand1))
+    return false;
+
+  if (ShapeStats)
+    ++ShapeStats->LocalGet2ScaleCommuteAccepted;
+
+  LLVM_DEBUG({
+    dbgs() << "wasm-tune-stackify: localget2-scale-commute"
            << " tune=" << ST.getTuneCPUName() << " instr=";
     Insert->print(dbgs());
   });
@@ -2228,7 +2370,7 @@ bool WebAssemblyRegStackify::runOnMachineFunction(MachineFunction &MF) {
         ProfileGateResult RematGate;
         ProfileGateResult TeeGate;
         if (MoveLegal) {
-          MoveGate = profileGateMove(WasmST, Reg, DefI, Insert, MRI, MFI);
+          MoveGate = profileGateMove(WasmST, Reg, DefI, Insert, Use, MRI, MFI);
           RecordProfileVeto(MoveGate);
         }
         if (RematLegal) {
@@ -2389,10 +2531,17 @@ bool WebAssemblyRegStackify::runOnMachineFunction(MachineFunction &MF) {
   }
 
   if (WasmST.getExecutionProfile().HasUWVM2RegisterRingModel) {
-    for (MachineBasicBlock &MBB : MF)
-      for (MachineInstr &MI : MBB)
-        Changed |= maybePostStackifyCommuteUWVM2DelayLocalRHS(
+    for (MachineBasicBlock &MBB : MF) {
+      for (MachineInstr &MI : MBB) {
+        if (maybePostStackifyCommuteUWVM2DelayLocalRHS(
+                &MI, WasmST, MRI, MFI, TII, &ShapeStats)) {
+          Changed = true;
+          continue;
+        }
+        Changed |= maybePostStackifyCommuteUWVM2LocalGet2Scale(
             &MI, WasmST, MRI, MFI, TII, &ShapeStats);
+      }
+    }
   }
 
   // If we used VALUE_STACK anywhere, add it to the live-in sets everywhere so

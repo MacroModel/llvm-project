@@ -22,7 +22,7 @@ CSV="$OUT/results.csv"
 SHAPE_CSV="$OUT/shape-summary.csv"
 
 printf 'bench,tune,runtime,iter,repeat,min_s,avg_s,status\n' > "$CSV"
-printf 'bench,tune,function,move,remat,tee,keep_local,historical_kept,profile_changed,profile_commute_tried,profile_commute_accepted,product_bank_boundary,int_mild_overflow,int_severe_overflow,fp_overflow,product_bank,m3_fp_bank,m3_distance,uwvm2_strict_fp_accum,uwvm2_tee_int_boundary,est_local_get,est_local_set,est_tee,keep_local_boundary,delay_local_rhs_commute_tried,delay_local_rhs_commute_accepted\n' > "$SHAPE_CSV"
+printf 'bench,tune,function,move,remat,tee,keep_local,historical_kept,profile_changed,profile_commute_tried,profile_commute_accepted,product_bank_boundary,int_mild_overflow,int_severe_overflow,fp_overflow,product_bank,m3_fp_bank,m3_distance,uwvm2_strict_fp_accum,uwvm2_move_int_boundary,uwvm2_tee_int_boundary,est_local_get,est_local_set,est_tee,keep_local_boundary,delay_local_rhs_commute_tried,delay_local_rhs_commute_accepted,localget2_scale_commute_tried,localget2_scale_commute_accepted\n' > "$SHAPE_CSV"
 
 bench_defs=(
   "dot6_fast BENCH_DOT6 fast"
@@ -122,18 +122,20 @@ dump_shape() {
       delete v;
       for (i = 2; i <= NF; i += 2)
         v[$i] = $(i + 1);
-      printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+      printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
              bench, tune, v["function"], v["move"], v["remat"], v["tee"],
              v["keep-local"], v["historical-kept"], v["profile-changed"],
              v["profile-commute-tried"], v["profile-commute-accepted"],
              v["product-bank-boundary"], v["int-mild-overflow"],
              v["int-severe-overflow"], v["fp-overflow"], v["product-bank"],
              v["m3-fp-bank"], v["m3-distance"],
-             v["uwvm2-strict-fp-accum"], v["uwvm2-tee-int-boundary"],
-             v["est-local-get"],
+             v["uwvm2-strict-fp-accum"], v["uwvm2-move-int-boundary"],
+             v["uwvm2-tee-int-boundary"], v["est-local-get"],
              v["est-local-set"], v["est-tee"], v["keep-local-boundary"],
              v["delay-local-rhs-commute-tried"],
-             v["delay-local-rhs-commute-accepted"];
+             v["delay-local-rhs-commute-accepted"],
+             v["localget2-scale-commute-tried"],
+             v["localget2-scale-commute-accepted"];
     }' "$log" >> "$SHAPE_CSV"
 }
 
